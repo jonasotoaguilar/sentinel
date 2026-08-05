@@ -1,0 +1,4 @@
+# CODEOWNERS — global ownership rule.
+# Add path-specific rules only when the repository requires them.
+
+* @jonasotoaguilar
