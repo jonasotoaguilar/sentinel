@@ -3,8 +3,11 @@
 
 mod cli;
 mod discovery;
+mod engine;
 mod errors;
 mod finding;
+mod normalize;
+mod render;
 #[cfg(test)]
 mod test_util;
 
@@ -12,15 +15,34 @@ use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
+use rayon::prelude::*;
+
 use cli::Command;
+use discovery::Discovered;
+use engine::secrets::SecretsEngine;
+use finding::Diagnostic;
 
 /// Runs the scan pipeline and returns the process exit code. Usage errors and
-/// operational failures map to exit 2; a completed scan exits 0. The report is
-/// the only stdout content; diagnostics go to stderr.
+/// operational failures map to exit 2; a completed scan exits 1 with findings
+/// and 0 otherwise. The report is the only stdout content; diagnostics go to
+/// stderr.
 pub fn run(
     args: &[String],
     cwd: &Path,
-    _stdout: &mut dyn Write,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ExitCode {
+    run_inner(&SecretsEngine::new(), args, cwd, stdout, stderr)
+}
+
+/// The pipeline over an explicit engine; tests inject engines containing a
+/// failing rule (task 3.3). Reads and detection run in parallel and are
+/// collected in file order; normalization sorts by (fingerprint, path, line).
+fn run_inner(
+    engine: &SecretsEngine,
+    args: &[String],
+    cwd: &Path,
+    stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> ExitCode {
     let cli = match cli::parse(args) {
@@ -32,26 +54,62 @@ pub fn run(
     };
     let Command::Scan = cli.command;
 
-    // Detection (the secrets engine) lands in PR3; this increment wires CLI
-    // validation and git-backed discovery, so clean and empty scans exit 0
-    // and usage/operational failures exit 2.
-    match discovery::Git::new().discover(cwd) {
-        Ok(_discovered) => ExitCode::SUCCESS,
+    let discovered = match discovery::Git::new().discover(cwd) {
+        Ok(discovered) => discovered,
         Err(error) => {
             let _ = writeln!(stderr, "sentinel: {error}");
-            ExitCode::from(errors::EXIT_OPERATIONAL)
+            return ExitCode::from(errors::EXIT_OPERATIONAL);
         }
+    };
+    let Discovered { root, files } = discovered;
+
+    // Engine-local rule failures warn once and never abort the scan.
+    let mut diagnostics = engine.init_diagnostics().to_vec();
+
+    let scans = files
+        .par_iter()
+        .map(|path| {
+            let path_text = path.to_string_lossy().replace('\\', "/");
+            let bytes = std::fs::read(root.join(path))
+                .map_err(|error| Diagnostic::read_failed(&path_text, &error))?;
+            Ok((path_text, engine.scan(&bytes)))
+        })
+        .collect::<Vec<_>>();
+
+    let mut findings = Vec::new();
+    for scan in scans {
+        match scan {
+            Ok((path, candidates)) => findings.extend(normalize::to_findings(&path, candidates)),
+            Err(diagnostic) => diagnostics.push(diagnostic),
+        }
+    }
+    let findings = normalize::dedupe_and_sort(findings);
+
+    let _ = stderr.write_all(&render::render_diagnostics(&diagnostics));
+    if let Err(error) = stdout.write_all(&render::render_findings(&findings)) {
+        let _ = writeln!(stderr, "sentinel: cannot write scan report: {error}");
+        return ExitCode::from(errors::EXIT_OPERATIONAL);
+    }
+    if findings.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use super::{run, run_inner};
+    use crate::engine::secrets::{RuleSpec, SecretsEngine};
+    use crate::finding::Severity;
     use crate::test_util::{temp_repo, write_tracked};
     use std::ffi::OsStr;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::ExitCode;
     use tempfile::TempDir;
+
+    const AWS_KEY: &str = "AKIASYNTHETICKEY1234";
+    const SYNTHETIC_TOKEN: &str = "sk-synthetic-1234567890";
 
     fn run_scan(args: &[&str], cwd: &Path) -> (ExitCode, Vec<u8>, Vec<u8>) {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -59,12 +117,101 @@ mod tests {
         (run(&args, cwd, &mut out, &mut err), out, err)
     }
 
+    fn secret_repo() -> (TempDir, PathBuf) {
+        let (dir, root) = temp_repo();
+        let contents = format!("aws_key = \"{AWS_KEY}\"\ntoken = {SYNTHETIC_TOKEN}\n");
+        write_tracked(&root, OsStr::new("env.example"), contents.as_bytes());
+        (dir, root)
+    }
+
+    /// A writer whose `write` always fails, for the broken-stdout path.
+    struct FailWriter;
+
+    impl std::io::Write for FailWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("synthetic write failure"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An engine whose first rule cannot compile; the remaining rules fire.
+    fn broken_rule_engine() -> SecretsEngine {
+        let broken = RuleSpec {
+            id: "SECRET-broken",
+            deprecated_ids: &[],
+            severity: Severity::High,
+            message: "broken rule",
+            pattern: "[",
+        };
+        SecretsEngine::from_specs(&[broken, crate::engine::secrets::RULE_SPECS[0]])
+    }
+
+    #[test]
+    fn synthetic_secrets_render_redacted_stdout_and_exit_one() {
+        let (_dir, root) = secret_repo();
+        let (code, out, err) = run_scan(&["scan"], &root);
+        assert_eq!(code, ExitCode::from(1));
+        let out_text = String::from_utf8(out).unwrap();
+        let err_text = String::from_utf8(err).unwrap();
+        let ids = ["SECRET-aws-access-key", "SECRET-synthetic-token"];
+        assert!(ids.iter().all(|id| out_text.contains(id)));
+        assert!(out_text.contains("[REDACTED]") && !out_text.contains('\u{1b}'));
+        assert!(!out_text.contains(AWS_KEY) && !out_text.contains(SYNTHETIC_TOKEN));
+        assert!(!err_text.contains(AWS_KEY) && !err_text.contains(SYNTHETIC_TOKEN));
+    }
+
+    #[test]
+    fn failing_rule_warns_on_stderr_but_scan_completes_with_findings() {
+        let (_dir, root) = secret_repo();
+        let args = vec!["scan".to_string()];
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_inner(&broken_rule_engine(), &args, &root, &mut out, &mut err);
+        assert_eq!(code, ExitCode::from(1));
+        let out_text = String::from_utf8(out).unwrap();
+        let err_text = String::from_utf8(err).unwrap();
+        assert!(err_text.contains("rule-failed") && err_text.contains("SECRET-broken"));
+        assert!(out_text.contains("SECRET-aws-access-key") && !out_text.contains("rule-failed"));
+    }
+
+    #[test]
+    fn broken_stdout_maps_to_exit_two_with_stderr_diagnostic() {
+        let (_dir, root) = secret_repo();
+        let args = vec!["scan".to_string()];
+        let mut err = Vec::new();
+        let code = run(&args, &root, &mut FailWriter, &mut err);
+        assert_eq!(code, ExitCode::from(2));
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("cannot write scan report")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_failure_warns_and_scan_continues() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, root) = temp_repo();
+        write_tracked(&root, OsStr::new("unreadable.txt"), b"x");
+        let path = root.join("unreadable.txt");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            return; // root may still read the file
+        }
+        let (code, out, err) = run_scan(&["scan"], &root);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(out.is_empty());
+        assert!(String::from_utf8(err).unwrap().contains("read-failed"));
+    }
+
     #[test]
     fn clean_and_empty_repos_exit_zero_with_empty_streams() {
-        for tracked in [Some(("ok.txt", "no secrets here")), None] {
+        for tracked in [Some(("ok.txt", b"no secrets here")), None] {
             let (_dir, root) = temp_repo();
             if let Some((name, contents)) = tracked {
-                write_tracked(&root, OsStr::new(name), contents.as_bytes());
+                write_tracked(&root, OsStr::new(name), contents);
             }
             let (code, out, err) = run_scan(&["scan"], &root);
             assert_eq!(code, ExitCode::SUCCESS);
