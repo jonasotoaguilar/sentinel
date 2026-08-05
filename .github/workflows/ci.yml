@@ -35,6 +35,7 @@ jobs:
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: stable
           components: llvm-tools-preview
 
       - name: Cache cargo registry and build artifacts
@@ -79,6 +80,8 @@ jobs:
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -116,6 +119,7 @@ jobs:
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: stable
           components: clippy
 
       - name: Cache cargo registry and build artifacts
