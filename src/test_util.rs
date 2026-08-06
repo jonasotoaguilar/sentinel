@@ -17,8 +17,41 @@ pub fn temp_repo() -> (TempDir, PathBuf) {
 
 /// Writes a file into the repository and stages it as a tracked file.
 pub fn write_tracked(root: &Path, name: &OsStr, contents: &[u8]) {
-    std::fs::write(root.join(name), contents).unwrap();
+    let path = root.join(name);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&path, contents).unwrap();
     git(root, [OsStr::new("add"), OsStr::new("--"), name]);
+}
+
+/// Writes a file into the repository without staging it (untracked).
+pub fn write_untracked(root: &Path, name: &OsStr, contents: &[u8]) {
+    let path = root.join(name);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&path, contents).unwrap();
+}
+
+/// Commits the staged changes with a hermetic test identity.
+pub fn commit_all(root: &Path, message: &str) {
+    git(
+        root,
+        [
+            OsStr::new("-c"),
+            OsStr::new("user.name=Sentinel Test"),
+            OsStr::new("-c"),
+            OsStr::new("user.email=sentinel@test.invalid"),
+            OsStr::new("commit"),
+            OsStr::new("-qm"),
+            OsStr::new(message),
+        ],
+    );
 }
 
 /// Runs git inside `cwd` with a hermetic config environment. Path-like

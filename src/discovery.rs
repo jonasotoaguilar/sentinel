@@ -498,10 +498,26 @@ fn os_string(bytes: &[u8]) -> OsString {
 mod tests {
     use super::{Git, Mode, is_safe_relative};
     use crate::errors::Error;
-    use crate::test_util::{temp_repo, write_tracked};
+    use crate::finding::Diagnostic;
+    use crate::test_util::{commit_all, git, temp_repo, write_tracked, write_untracked};
     use std::ffi::OsStr;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    const TEN_MIB: u64 = 10 * 1024 * 1024;
+
+    fn skipped_large(path: &str) -> Diagnostic {
+        Diagnostic {
+            code: "skipped-large",
+            path: path.to_string(),
+            rule: String::new(),
+            message: format!("{TEN_MIB} bytes exceeds the 10 MiB scan limit"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Preserved tracked-only behavior (PR1 regression guard)
+    // ------------------------------------------------------------------
 
     #[test]
     fn root_resolves_from_nested_cwd() {
@@ -600,22 +616,6 @@ mod tests {
     }
 
     #[test]
-    fn repeated_discovery_is_identical() {
-        let (_dir, root) = temp_repo();
-        write_tracked(&root, OsStr::new("b.txt"), b"1");
-        write_tracked(&root, OsStr::new("a.txt"), b"2");
-
-        let git = Git::new();
-        let first = git.discover(&root, Mode::Ci).unwrap();
-        let second = git.discover(&root, Mode::Ci).unwrap();
-        assert_eq!(first, second);
-        assert_eq!(
-            first.files,
-            vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]
-        );
-    }
-
-    #[test]
     fn record_safety_matrix_is_enforced() {
         for record in [b"/absolute".as_slice(), b"../up", b"a/../b", b"a//b"] {
             assert!(!is_safe_relative(record), "should reject {record:?}");
@@ -628,5 +628,269 @@ mod tests {
         ] {
             assert!(is_safe_relative(record), "should accept {record:?}");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 2.1: untracked + hidden (S1), .gitignore (S2), nested repo (S6), symlink (S7)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn untracked_hidden_env_files_are_scanned_in_both_modes() {
+        let (_dir, root) = temp_repo();
+        write_tracked(&root, OsStr::new("tracked.txt"), b"x");
+        write_untracked(&root, OsStr::new(".env"), b"token = secret\n");
+        write_untracked(&root, OsStr::new(".hidden/secret.txt"), b"x");
+
+        for mode in [Mode::Local, Mode::Ci] {
+            let discovered = Git::new().discover(&root, mode).unwrap();
+            assert_eq!(
+                discovered.files,
+                vec![
+                    PathBuf::from(".env"),
+                    PathBuf::from(".hidden/secret.txt"),
+                    PathBuf::from("tracked.txt"),
+                ],
+                "mode {mode:?} must include untracked hidden files"
+            );
+            assert!(discovered.diagnostics.is_empty(), "mode {mode:?}");
+        }
+    }
+
+    #[test]
+    fn gitignored_untracked_files_and_directories_are_excluded() {
+        let (_dir, root) = temp_repo();
+        write_untracked(&root, OsStr::new(".gitignore"), b"*.log\nsecret-dir/\n");
+        write_untracked(&root, OsStr::new("notes.log"), b"x");
+        write_untracked(&root, OsStr::new("notes.txt"), b"x");
+        write_untracked(&root, OsStr::new("secret-dir/inner.txt"), b"x");
+        write_untracked(&root, OsStr::new("visible/ok.txt"), b"x");
+
+        let discovered = Git::new().discover(&root, Mode::Ci).unwrap();
+        assert_eq!(
+            discovered.files,
+            vec![
+                PathBuf::from(".gitignore"),
+                PathBuf::from("notes.txt"),
+                PathBuf::from("visible/ok.txt"),
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_git_repository_is_skipped() {
+        let (_dir, root) = temp_repo();
+        write_tracked(&root, OsStr::new("top.txt"), b"x");
+        let nested = root.join("vendor/inner");
+        std::fs::create_dir_all(&nested).unwrap();
+        git(&nested, ["init", "-q"]);
+        write_untracked(&nested, OsStr::new("inner-secret.txt"), b"x");
+
+        let discovered = Git::new().discover(&root, Mode::Ci).unwrap();
+        assert_eq!(discovered.files, vec![PathBuf::from("top.txt")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_outside_repo_is_not_followed() {
+        use std::os::unix::fs::symlink;
+        let (_dir, root) = temp_repo();
+        write_tracked(&root, OsStr::new("target.txt"), b"x");
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), b"token = secret\n").unwrap();
+        symlink(outside.path().join("secret.txt"), root.join("link-out")).unwrap();
+
+        let discovered = Git::new().discover(&root, Mode::Ci).unwrap();
+        assert_eq!(discovered.files, vec![PathBuf::from("target.txt")]);
+    }
+
+    // ------------------------------------------------------------------
+    // 2.2: tracked-wins (S3), .sentinelignore (S4, S5), commit-state matrix
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn force_added_tracked_file_is_retained_despite_gitignore() {
+        let (_dir, root) = temp_repo();
+        write_untracked(&root, OsStr::new(".gitignore"), b"*.env\n");
+        let name = OsStr::new("forced.env");
+        std::fs::write(root.join(name), b"x").unwrap();
+        git(
+            &root,
+            [OsStr::new("add"), OsStr::new("-f"), OsStr::new("--"), name],
+        );
+
+        let discovered = Git::new().discover(&root, Mode::Ci).unwrap();
+        assert_eq!(
+            discovered.files,
+            vec![PathBuf::from(".gitignore"), PathBuf::from("forced.env")]
+        );
+    }
+
+    #[test]
+    fn sentinelignore_excludes_tracked_and_untracked_entries() {
+        let (_dir, root) = temp_repo();
+        write_untracked(&root, OsStr::new(".sentinelignore"), b"*.secret\n");
+        write_tracked(&root, OsStr::new("tracked.secret"), b"x");
+        write_tracked(&root, OsStr::new("tracked.keep"), b"x");
+        write_untracked(&root, OsStr::new("untracked.secret"), b"x");
+        write_untracked(&root, OsStr::new("untracked.keep"), b"x");
+
+        let discovered = Git::new().discover(&root, Mode::Ci).unwrap();
+        assert_eq!(
+            discovered.files,
+            vec![
+                PathBuf::from("tracked.keep"),
+                PathBuf::from("untracked.keep"),
+            ]
+        );
+    }
+
+    #[test]
+    fn sentinelignore_directory_pattern_excludes_whole_subtree() {
+        let (_dir, root) = temp_repo();
+        write_untracked(&root, OsStr::new(".sentinelignore"), b"build/\n");
+        write_tracked(&root, OsStr::new("build/out.txt"), b"x");
+        write_untracked(&root, OsStr::new("build/gen.txt"), b"x");
+        write_tracked(&root, OsStr::new("src/main.rs"), b"x");
+
+        let discovered = Git::new().discover(&root, Mode::Ci).unwrap();
+        assert_eq!(discovered.files, vec![PathBuf::from("src/main.rs")]);
+    }
+
+    #[test]
+    fn empty_index_repo_still_finds_untracked_files() {
+        let (_dir, root) = temp_repo(); // initialized, no commits
+        write_untracked(&root, OsStr::new("fresh.env"), b"token = secret\n");
+
+        let discovered = Git::new().discover(&root, Mode::Ci).unwrap();
+        assert_eq!(discovered.files, vec![PathBuf::from("fresh.env")]);
+    }
+
+    #[test]
+    fn committed_file_is_retained_after_commit_all() {
+        let (_dir, root) = temp_repo();
+        write_tracked(&root, OsStr::new("committed.txt"), b"x");
+        commit_all(&root, "initial");
+
+        let discovered = Git::new().discover(&root, Mode::Ci).unwrap();
+        assert_eq!(discovered.files, vec![PathBuf::from("committed.txt")]);
+    }
+
+    // ------------------------------------------------------------------
+    // 2.3: size guard (S8), invalid path (S9), `-C` file, cwd equivalence
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn oversized_files_are_skipped_with_a_diagnostic() {
+        let (_dir, root) = temp_repo();
+        let big = root.join("big.bin");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(TEN_MIB)
+            .unwrap();
+        let ok = root.join("ok.bin");
+        std::fs::File::create(&ok)
+            .unwrap()
+            .set_len(TEN_MIB - 1)
+            .unwrap();
+        write_tracked(&root, OsStr::new("tracked-big.bin"), b"x");
+        let tracked_big = root.join("tracked-big.bin");
+        std::fs::File::create(&tracked_big)
+            .unwrap()
+            .set_len(TEN_MIB)
+            .unwrap();
+
+        let discovered = Git::new().discover(&root, Mode::Ci).unwrap();
+        assert_eq!(discovered.files, vec![PathBuf::from("ok.bin")]);
+        assert_eq!(
+            discovered.diagnostics,
+            vec![skipped_large("big.bin"), skipped_large("tracked-big.bin")]
+        );
+    }
+
+    #[test]
+    fn invalid_records_warn_and_are_excluded() {
+        let (_dir, root) = temp_repo();
+        let git = Git::new();
+        for record in [b"/absolute".as_slice(), b"../up", b"a/../b"] {
+            let diagnostic = git.accept_record(&root, record).unwrap_err();
+            assert_eq!(diagnostic.code, "invalid-path", "record {record:?}");
+        }
+        // A valid record for an absent file is silently excluded.
+        assert!(git.accept_record(&root, b"missing.txt").unwrap().is_none());
+        // A valid present file is accepted.
+        write_tracked(&root, OsStr::new("ok.txt"), b"x");
+        assert_eq!(
+            git.accept_record(&root, b"ok.txt").unwrap(),
+            Some(PathBuf::from("ok.txt"))
+        );
+    }
+
+    #[test]
+    fn c_like_untracked_file_is_scanned_as_a_file() {
+        let (_dir, root) = temp_repo();
+        write_untracked(&root, OsStr::new("-C"), b"contents");
+
+        let discovered = Git::new().discover(&root, Mode::Ci).unwrap();
+        assert_eq!(discovered.files, vec![PathBuf::from("-C")]);
+    }
+
+    #[test]
+    fn nested_and_absolute_cwd_discover_identically() {
+        let (_dir, root) = temp_repo();
+        write_tracked(&root, OsStr::new("top.txt"), b"x");
+        write_untracked(&root, OsStr::new(".env"), b"x");
+        let nested = root.join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let git = Git::new();
+        let from_root = git.discover(&root, Mode::Ci).unwrap();
+        let from_nested = git.discover(&nested, Mode::Ci).unwrap();
+        assert_eq!(from_root, from_nested);
+    }
+
+    // ------------------------------------------------------------------
+    // 2.4: repeated + parallel determinism (S11, S12)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn repeated_discovery_is_byte_identical_with_diagnostics() {
+        let (_dir, root) = temp_repo();
+        write_tracked(&root, OsStr::new("b.txt"), b"1");
+        write_untracked(&root, OsStr::new(".env"), b"x");
+        let big = root.join("big.bin");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(TEN_MIB)
+            .unwrap();
+
+        let git = Git::new();
+        let first = git.discover(&root, Mode::Ci).unwrap();
+        let second = git.discover(&root, Mode::Ci).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.files,
+            vec![PathBuf::from(".env"), PathBuf::from("b.txt")]
+        );
+        assert_eq!(first.diagnostics, vec![skipped_large("big.bin")]);
+    }
+
+    #[test]
+    fn parallel_discovery_is_byte_identical() {
+        let (_dir, root) = temp_repo();
+        write_tracked(&root, OsStr::new("a.txt"), b"1");
+        write_untracked(&root, OsStr::new("z.env"), b"2");
+
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let root = root.clone();
+                handles.push(scope.spawn(move || Git::new().discover(&root, Mode::Ci).unwrap()));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        assert_eq!(results[0], results[1]);
     }
 }
