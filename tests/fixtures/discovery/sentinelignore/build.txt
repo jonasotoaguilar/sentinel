@@ -1,0 +1,2 @@
+# SYNTHETIC FIXTURE - not a real ignore policy (sentinel discovery corpus).
+build/
