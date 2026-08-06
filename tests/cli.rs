@@ -237,6 +237,29 @@ fn empty_repo_exits_zero_with_no_output() {
 }
 
 #[test]
+fn ci_flag_is_accepted_and_scans_the_repository() {
+    let (_dir, root) = golden_repo();
+    let output = scan_bin(&root).arg("--ci").output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = text_of(&output.stdout);
+    assert!(
+        stdout.contains("config.env:2:12: critical SECRET-aws-access-key"),
+        "stdout: {stdout}"
+    );
+    assert!(!stdout.contains(AWS_KEY) && !stdout.contains(TOKEN));
+}
+
+#[test]
+fn ci_flag_on_clean_repo_exits_zero_with_empty_streams() {
+    let (_dir, root) = temp_repo();
+    track_fixture(&root, "clean/README.md", "README.md");
+    let output = scan_bin(&root).arg("--ci").output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn findings_exit_one_with_redacted_report() {
     let (_dir, root) = temp_repo();
     track_fixture(&root, "basic/env.example", "env.example");

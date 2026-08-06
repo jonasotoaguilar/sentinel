@@ -114,7 +114,7 @@ mod tests {
     use super::{run, run_inner};
     use crate::engine::secrets::{RuleSpec, SecretsEngine};
     use crate::finding::Severity;
-    use crate::test_util::{temp_repo, write_tracked};
+    use crate::test_util::{temp_repo, write_tracked, write_untracked};
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
@@ -276,6 +276,57 @@ mod tests {
                 "args {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn ci_flag_is_accepted_and_runs_the_pipeline() {
+        let (_dir, root) = temp_repo();
+        let (code, out, err) = run_scan(&["scan", "--ci"], &root);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(out.is_empty());
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn untracked_secret_is_scanned_locally_and_under_ci() {
+        for args in [&["scan"][..], &["scan", "--ci"]] {
+            let (_dir, root) = temp_repo();
+            write_tracked(&root, OsStr::new("clean.txt"), b"no secrets");
+            write_untracked(
+                &root,
+                OsStr::new(".env"),
+                b"token = sk-synthetic-1234567890\n",
+            );
+
+            let (code, out, err) = run_scan(args, &root);
+            assert_eq!(code, ExitCode::from(1), "args {args:?}");
+            let out_text = String::from_utf8(out).unwrap();
+            let err_text = String::from_utf8(err).unwrap();
+            assert!(out_text.contains(".env:1:"), "args {args:?}: {out_text}");
+            assert!(out_text.contains("SECRET-synthetic-token"));
+            assert!(!out_text.contains(SYNTHETIC_TOKEN));
+            assert!(!err_text.contains(SYNTHETIC_TOKEN));
+        }
+    }
+
+    #[test]
+    fn oversized_untracked_file_warns_without_changing_exit() {
+        let (_dir, root) = temp_repo();
+        write_tracked(&root, OsStr::new("clean.txt"), b"no secrets");
+        let big = root.join("big.bin");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(10 * 1024 * 1024)
+            .unwrap();
+
+        let (code, out, err) = run_scan(&["scan"], &root);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(out.is_empty());
+        let err_text = String::from_utf8(err).unwrap();
+        assert!(
+            err_text.contains("sentinel: skipped-large: big.bin"),
+            "stderr: {err_text}"
+        );
     }
 
     #[test]
