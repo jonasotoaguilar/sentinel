@@ -21,7 +21,6 @@ use tempfile::TempDir;
 /// The two named synthetic values the fixture corpus may contain (task 4.1).
 const AWS_KEY: &str = "AKIASYNTHETICKEY1234";
 const TOKEN: &str = "sk-synthetic-1234567890";
-#[allow(dead_code)]
 const TEN_MIB: u64 = 10 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -97,7 +96,6 @@ fn track_fixture(root: &Path, fixture_rel: &str, repo_rel: &str) {
 }
 
 /// Commits the staged changes with a hermetic test identity.
-#[expect(dead_code)]
 fn commit_all(root: &Path, message: &str) {
     git(
         root,
@@ -130,7 +128,6 @@ fn scan_bin(cwd: &Path) -> AssertCommand {
 }
 
 /// Spawns a scan process without waiting (for concurrent determinism runs).
-#[expect(dead_code)]
 fn spawn_scan(cwd: &Path) -> std::process::Child {
     Command::new(assert_cmd::cargo::cargo_bin("sentinel"))
         .arg("scan")
@@ -153,7 +150,6 @@ fn text_of(bytes: &[u8]) -> String {
 /// A repository with tracked and untracked findings plus a 10 MiB untracked
 /// file, so both stdout (findings) and stderr (`skipped-large`) are
 /// non-trivial and deterministic.
-#[expect(dead_code)]
 fn discovery_repo() -> (TempDir, PathBuf) {
     let (dir, root) = temp_repo();
     track_fixture(&root, "secrets/env.example", "env.example");
@@ -173,7 +169,6 @@ fn discovery_repo() -> (TempDir, PathBuf) {
 
 /// (path, len, mtime-nanos) for every entry under `root` — the read-boundary
 /// snapshot (cli-scan spec: paths and mtimes unchanged after a scan).
-#[expect(dead_code)]
 fn snapshot_tree(root: &Path) -> Vec<(PathBuf, u64, u128)> {
     fn walk(root: &Path, dir: &Path, entries: &mut Vec<(PathBuf, u64, u128)>) {
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -205,7 +200,6 @@ fn snapshot_tree(root: &Path) -> Vec<(PathBuf, u64, u128)> {
 /// Root bypasses permission bits; a write probe into a 0o555 directory tells
 /// us whether the chmod-based tests are meaningful on this host.
 #[cfg(unix)]
-#[expect(dead_code)]
 fn running_as_root() -> bool {
     use std::os::unix::fs::PermissionsExt;
     let probe = TempDir::new().unwrap();
@@ -375,4 +369,268 @@ fn sentinelignore_excludes_tracked_and_untracked_files() {
     assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
     assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
     assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
+}
+
+#[test]
+fn sentinelignore_directory_pattern_excludes_whole_subtree() {
+    let (_dir, root) = temp_repo();
+    track_fixture(&root, "clean/main.rs", "src/main.rs");
+    write_tracked(
+        &root,
+        OsStr::new("build/out.txt"),
+        format!("token = {TOKEN}\n").as_bytes(),
+    );
+    write_untracked(
+        &root,
+        OsStr::new("build/gen.txt"),
+        format!("aws_key = \"{AWS_KEY}\"\n").as_bytes(),
+    );
+    write_untracked(
+        &root,
+        OsStr::new(".sentinelignore"),
+        &fixture_bytes("sentinelignore/build.txt"),
+    );
+
+    let output = scan_bin(&root).arg("--ci").output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
+}
+
+#[test]
+fn nested_git_repository_is_skipped() {
+    let (_dir, root) = temp_repo();
+    write_tracked(&root, OsStr::new("top.txt"), b"clean");
+    let nested = root.join("vendor/inner");
+    std::fs::create_dir_all(&nested).unwrap();
+    git(&nested, ["init", "-q"]);
+    write_untracked(
+        &nested,
+        OsStr::new("inner-secret.env"),
+        format!("token = {TOKEN}\n").as_bytes(),
+    );
+
+    let output = scan_bin(&root).arg("--ci").output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_outside_repo_is_not_followed() {
+    use std::os::unix::fs::symlink;
+    let (_dir, root) = temp_repo();
+    write_tracked(&root, OsStr::new("target.txt"), b"clean");
+    let outside = TempDir::new().unwrap();
+    let outside_secret = outside.path().join("outside-secret.txt");
+    std::fs::write(&outside_secret, format!("token = {TOKEN}\n")).unwrap();
+    symlink(&outside_secret, root.join("link-out")).unwrap();
+
+    let output = scan_bin(&root).arg("--ci").output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "stderr: {:?}", output.stderr);
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
+}
+
+#[test]
+fn untracked_c_like_file_is_scanned_as_a_file() {
+    let (_dir, root) = temp_repo();
+    write_untracked(
+        &root,
+        OsStr::new("-C"),
+        format!("token = {TOKEN}\n").as_bytes(),
+    );
+
+    let output = scan_bin(&root).arg("--ci").output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = text_of(&output.stdout);
+    assert!(
+        stdout.contains("-C:1:") && stdout.contains("SECRET-synthetic-token"),
+        "stdout: {stdout}"
+    );
+    assert!(!stdout.contains(TOKEN));
+}
+
+#[test]
+fn empty_index_repo_still_discovers_untracked_secrets() {
+    let (_dir, root) = temp_repo(); // initialized, no commits
+    write_untracked(
+        &root,
+        OsStr::new("fresh.env"),
+        format!("token = {TOKEN}\n").as_bytes(),
+    );
+
+    let output = scan_bin(&root).arg("--ci").output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = text_of(&output.stdout);
+    assert!(stdout.contains("fresh.env:1:"), "stdout: {stdout}");
+    assert!(!stdout.contains(TOKEN));
+}
+
+#[test]
+fn committed_files_are_retained_after_commit_all() {
+    let (_dir, root) = temp_repo();
+    write_tracked(
+        &root,
+        OsStr::new("committed.env"),
+        format!("token = {TOKEN}\n").as_bytes(),
+    );
+    commit_all(&root, "initial");
+
+    let output = scan_bin(&root).arg("--ci").output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = text_of(&output.stdout);
+    assert!(stdout.contains("committed.env:1:"), "stdout: {stdout}");
+    assert!(!stdout.contains(TOKEN));
+}
+
+// ---------------------------------------------------------------------------
+// git-discovery: size guard (S8) and unreadable files (S10)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn oversized_untracked_file_is_skipped_without_changing_exit() {
+    let (_dir, root) = temp_repo();
+    track_fixture(&root, "secrets/env.example", "env.example");
+    let huge = root.join("huge.bin");
+    std::fs::File::create(&huge)
+        .unwrap()
+        .set_len(TEN_MIB)
+        .unwrap();
+
+    let output = scan_bin(&root).output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the size guard must not change the exit status"
+    );
+    let stdout = text_of(&output.stdout);
+    assert!(
+        stdout.contains("env.example:2:12:"),
+        "remaining files still scanned: {stdout}"
+    );
+    assert!(
+        !stdout.contains("huge.bin"),
+        "oversized file must be excluded: {stdout}"
+    );
+    let stderr = text_of(&output.stderr);
+    assert!(
+        stderr.contains("sentinel: skipped-large: huge.bin"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn oversized_untracked_file_on_clean_repo_exits_zero() {
+    let (_dir, root) = temp_repo();
+    track_fixture(&root, "clean/main.rs", "src/main.rs");
+    let huge = root.join("huge.bin");
+    std::fs::File::create(&huge)
+        .unwrap()
+        .set_len(TEN_MIB)
+        .unwrap();
+
+    let output = scan_bin(&root).output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    let stderr = text_of(&output.stderr);
+    assert!(
+        stderr.contains("sentinel: skipped-large: huge.bin"),
+        "stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_untracked_file_warns_and_scan_continues() {
+    use std::os::unix::fs::PermissionsExt;
+    if running_as_root() {
+        eprintln!("skipping unreadable-file test: running as root");
+        return;
+    }
+    let (_dir, root) = temp_repo();
+    track_fixture(&root, "secrets/env.example", "env.example");
+    write_untracked(
+        &root,
+        OsStr::new("locked.env"),
+        format!("token = {TOKEN}\n").as_bytes(),
+    );
+    let locked = root.join("locked.env");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = scan_bin(&root).output().unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "scan must complete despite the read failure"
+    );
+    let stdout = text_of(&output.stdout);
+    assert!(
+        stdout.contains("env.example:2:12:"),
+        "remaining files still scanned: {stdout}"
+    );
+    assert!(
+        !stdout.contains("locked.env"),
+        "unreadable file must be skipped: {stdout}"
+    );
+    let stderr = text_of(&output.stderr);
+    assert!(
+        stderr.contains("sentinel: read-failed: locked.env"),
+        "stderr: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// git-discovery: repeated + concurrent determinism (S11, S12)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn repeated_and_concurrent_runs_are_byte_identical() {
+    let (_dir, root) = discovery_repo();
+    let before = snapshot_tree(&root);
+
+    let first = scan_bin(&root).output().unwrap();
+    let second = scan_bin(&root).output().unwrap();
+    assert_eq!(first.status.code(), Some(1));
+    assert_eq!(second.status.code(), first.status.code());
+    assert_eq!(
+        first.stdout, second.stdout,
+        "repeated stdout must be byte-identical"
+    );
+    assert_eq!(
+        first.stderr, second.stderr,
+        "repeated stderr must be byte-identical"
+    );
+
+    let concurrent: Vec<_> = (0..2).map(|_| spawn_scan(&root)).collect();
+    let results: Vec<_> = concurrent
+        .into_iter()
+        .map(|child| child.wait_with_output().unwrap())
+        .collect();
+    assert_eq!(results[0].status.code(), Some(1));
+    assert_eq!(results[1].status.code(), results[0].status.code());
+    assert_eq!(
+        results[0].stdout, results[1].stdout,
+        "concurrent stdout must be byte-identical"
+    );
+    assert_eq!(
+        results[0].stderr, results[1].stderr,
+        "concurrent stderr must be byte-identical"
+    );
+    assert_eq!(
+        results[0].stdout, first.stdout,
+        "concurrent runs must match serial output"
+    );
+    assert_eq!(
+        results[0].stderr, first.stderr,
+        "concurrent stderr must match serial output"
+    );
+
+    let after = snapshot_tree(&root);
+    assert_eq!(
+        before, after,
+        "scan must not write, modify, or create files"
+    );
 }
