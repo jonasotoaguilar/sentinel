@@ -41,7 +41,7 @@ pub fn parse(args: &[String]) -> Result<Cli, clap::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse;
+    use super::{Command, parse};
     use clap::error::ErrorKind;
 
     fn args(tokens: &[&str]) -> Vec<String> {
@@ -50,7 +50,14 @@ mod tests {
 
     #[test]
     fn scan_subcommand_is_accepted() {
-        assert!(parse(&args(&["scan"])).is_ok());
+        let cli = parse(&args(&["scan"])).unwrap();
+        assert!(matches!(cli.command, Command::Scan { ci: false }));
+    }
+
+    #[test]
+    fn ci_flag_parses_to_scan_with_ci_true() {
+        let cli = parse(&args(&["scan", "--ci"])).unwrap();
+        assert!(matches!(cli.command, Command::Scan { ci: true }));
     }
 
     #[test]
