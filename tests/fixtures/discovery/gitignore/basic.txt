@@ -1,0 +1,3 @@
+# SYNTHETIC FIXTURE - not a real ignore policy (sentinel discovery corpus).
+*.env
+secret-dir/
