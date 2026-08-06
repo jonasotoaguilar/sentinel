@@ -1,28 +1,58 @@
 //! Git-backed discovery: repository root + tracked files, "the way Git sees
-//! it" (git-discovery spec).
+//! it", unioned with an ignore-aware walk of untracked files (git-discovery
+//! spec, discovery-hardening design).
 //!
 //! Git is invoked with separate `Command` arguments, never a shell; the
 //! working directory alone selects the repository. `rev-parse
 //! --show-toplevel` resolves the root and `ls-files -z` enumerates tracked
 //! files as NUL-delimited bytes, so spaces, newlines, and non-ASCII (and
-//! invalid-UTF-8 on Unix) are preserved exactly. Records that are absolute,
-//! parent-traversing, empty-interior, symlinks, or non-regular files are
-//! rejected before they enter the scan input set.
+//! invalid-UTF-8 on Unix) are preserved exactly.
+//!
+//! A serial `ignore` walker covers present untracked files. Tracked
+//! membership wins over Git ignores (force-added files stay), a
+//! `.sentinelignore` matcher post-filters the full union, and every
+//! candidate passes a shared relative-path, regular-file, and 10 MiB size
+//! guard. Files and diagnostics are sorted deterministically; recoverable
+//! failures (walk, metadata, oversize, invalid path) skip only that path
+//! with a stable diagnostic code.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use crate::errors::Error;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::{DirEntry, WalkBuilder};
 
-/// Discovered scan input set: the repository root and its tracked files.
+use crate::errors::Error;
+use crate::finding::Diagnostic;
+
+/// Files at or above this size are skipped with a `skipped-large` diagnostic
+/// (git-discovery spec: size guard).
+pub const MAX_SCAN_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Discovery mode. `Local` keeps git-natural ambient ignore sources
+/// (parent `.gitignore`, global gitignore, `.git/info/exclude`); `Ci`
+/// disables all three for repository-local, machine-independent input.
+/// Both modes include hidden files, never follow symlinks, require a git
+/// repository, and honor `.sentinelignore` files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Local,
+    Ci,
+}
+
+/// Discovered scan input set: the repository root, its files, and any
+/// non-fatal discovery diagnostics (rendered to stderr).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovered {
     /// Absolute repository root (worktree top level).
     pub root: PathBuf,
-    /// Validated tracked files, repo-relative, sorted deterministically.
+    /// Validated files, repo-relative, sorted deterministically.
     pub files: Vec<PathBuf>,
+    /// Non-fatal warnings emitted during discovery, sorted deterministically.
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 /// Git-backed discovery. `program` defaults to `git` on PATH; tests inject a
@@ -46,24 +76,103 @@ impl Git {
         }
     }
 
-    /// Resolves the repository root and the validated tracked file set for
-    /// `cwd`. Every failure is a typed operational error (exit 2). `ls-files`
-    /// runs from the resolved root, so emitted paths are root-relative even
-    /// when `cwd` is nested inside the repository.
-    pub fn discover(&self, cwd: &Path) -> Result<Discovered, Error> {
+    /// Resolves the repository root and the validated file set for `cwd`
+    /// under `mode`. Every fatal failure is a typed operational error
+    /// (exit 2). `ls-files` runs from the resolved root, so emitted paths
+    /// are root-relative even when `cwd` is nested inside the repository.
+    ///
+    /// Order of operations: tracked records (`git ls-files -z`) and walked
+    /// untracked candidates are each validated (relative path, regular file,
+    /// size), unioned with tracked membership winning, post-filtered by
+    /// `.sentinelignore`, then sorted — files and diagnostics alike.
+    pub fn discover(&self, cwd: &Path, mode: Mode) -> Result<Discovered, Error> {
+        #[cfg(test)]
+        pin_test_ambient_env();
+
         if !cwd.is_dir() {
             return Err(Error::InvalidWorkingDirectory {
                 path: cwd.to_path_buf(),
             });
         }
         let root = self.show_toplevel(cwd)?;
-        let records = self.tracked_records(&root)?;
-        let mut files: Vec<PathBuf> = records
-            .iter()
-            .filter_map(|record| self.accept_record(&root, record))
-            .collect();
-        files.sort();
-        Ok(Discovered { root, files })
+        let mut diagnostics = Vec::new();
+
+        // Tracked authority: byte-preserving `git ls-files -z`.
+        let mut files: BTreeSet<PathBuf> = BTreeSet::new();
+        for record in self.tracked_records(&root)? {
+            match self.accept_record(&root, &record) {
+                Ok(Some(path)) => {
+                    files.insert(path);
+                }
+                Ok(None) => {}
+                Err(diagnostic) => diagnostics.push(diagnostic),
+            }
+        }
+
+        // Untracked candidates from the configured ignore walker.
+        let mut sentinel_ignores = Vec::new();
+        for entry in self.walk_untracked(&root, mode) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(diagnostic) => {
+                    diagnostics.push(diagnostic);
+                    continue;
+                }
+            };
+            // The walk root itself is not a scan candidate.
+            if entry.depth() == 0 {
+                continue;
+            }
+            // Custom ignore files are consumed as ignore sources, never
+            // scanned (unlike `.gitignore`, which the walker yields).
+            if entry.file_name() == ".sentinelignore" {
+                sentinel_ignores.push(entry.path().to_path_buf());
+                continue;
+            }
+            // Tracked-wins: paths already accepted from `ls-files` are not
+            // re-validated (no duplicate diagnostics, no duplicate work).
+            let rel = match entry.path().strip_prefix(&root) {
+                Ok(rel) => rel,
+                Err(_) => {
+                    diagnostics.push(Diagnostic {
+                        code: "invalid-path",
+                        path: entry.path().display().to_string(),
+                        rule: String::new(),
+                        message: "outside the repository root".into(),
+                    });
+                    continue;
+                }
+            };
+            if files.contains(rel) {
+                continue;
+            }
+            match self.accept_candidate(&root, entry.path()) {
+                Ok(Some(path)) => {
+                    files.insert(path);
+                }
+                Ok(None) => {}
+                Err(diagnostic) => diagnostics.push(diagnostic),
+            }
+        }
+
+        // `.sentinelignore` post-filters the full union and takes precedence
+        // over the tracked-beats-ignore rule (S4, S5).
+        if let Some(matcher) = sentinel_matcher(&root, &sentinel_ignores, &mut diagnostics) {
+            files.retain(|rel| {
+                !matcher
+                    .matched_path_or_any_parents(root.join(rel), false)
+                    .is_ignore()
+            });
+        }
+
+        diagnostics.sort();
+        diagnostics.dedup();
+        let files = files.into_iter().collect();
+        Ok(Discovered {
+            root,
+            files,
+            diagnostics,
+        })
     }
 
     fn show_toplevel(&self, cwd: &Path) -> Result<PathBuf, Error> {
@@ -129,18 +238,185 @@ impl Git {
         Ok(output)
     }
 
-    /// Validates one `ls-files` record and rejects unsafe or non-regular
-    /// paths (symlinks, submodule gitlinks, deleted files).
-    fn accept_record(&self, root: &Path, record: &[u8]) -> Option<PathBuf> {
+    /// Validates one `ls-files` record against the shared safety and size
+    /// guards. Unsafe records warn (`invalid-path`); missing or non-regular
+    /// records are silently excluded.
+    fn accept_record(&self, root: &Path, record: &[u8]) -> Result<Option<PathBuf>, Diagnostic> {
         if !is_safe_relative(record) {
-            return None;
+            return Err(Diagnostic {
+                code: "invalid-path",
+                path: String::from_utf8_lossy(record).into_owned(),
+                rule: String::new(),
+                message: "not a safe repository-relative path".into(),
+            });
         }
-        let path = PathBuf::from(os_string(record));
-        match fs::symlink_metadata(root.join(&path)) {
-            Ok(metadata) if metadata.file_type().is_file() => Some(path),
-            _ => None,
+        self.accept_candidate(root, &root.join(os_string(record)))
+    }
+
+    /// Validates one walker candidate: strips the root prefix, enforces the
+    /// shared repo-relative safety check, requires a regular file via
+    /// `symlink_metadata` (links are never followed), and applies the 10 MiB
+    /// size guard. Recoverable failures skip only that path with a stable
+    /// diagnostic.
+    fn accept_candidate(&self, root: &Path, path: &Path) -> Result<Option<PathBuf>, Diagnostic> {
+        let rel = match path.strip_prefix(root) {
+            Ok(rel) => rel,
+            Err(_) => {
+                return Err(Diagnostic {
+                    code: "invalid-path",
+                    path: path.display().to_string(),
+                    rule: String::new(),
+                    message: "outside the repository root".into(),
+                });
+            }
+        };
+        if !is_safe_relative(&record_bytes(rel)) {
+            return Err(Diagnostic {
+                code: "invalid-path",
+                path: display_rel(rel),
+                rule: String::new(),
+                message: "not a safe repository-relative path".into(),
+            });
+        }
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                if metadata.len() >= MAX_SCAN_FILE_BYTES {
+                    return Err(Diagnostic {
+                        code: "skipped-large",
+                        path: display_rel(rel),
+                        rule: String::new(),
+                        message: format!("{} bytes exceeds the 10 MiB scan limit", metadata.len()),
+                    });
+                }
+                Ok(Some(rel.to_path_buf()))
+            }
+            _ => Ok(None),
         }
     }
+
+    /// Walks the repository for present untracked files (serial, for
+    /// deterministic warning order). Both modes include hidden entries and
+    /// never follow symlinks; `Ci` drops parent, global, and
+    /// `.git/info/exclude` ambient ignore sources. `.git` and any nested
+    /// repository are pruned via `filter_entry`; walker failures become
+    /// `walk-failed` diagnostics.
+    fn walk_untracked(&self, root: &Path, mode: Mode) -> Vec<Result<DirEntry, Diagnostic>> {
+        let mut builder = WalkBuilder::new(root);
+        builder
+            .hidden(false)
+            .follow_links(false)
+            .require_git(true)
+            .add_custom_ignore_filename(".sentinelignore");
+        if mode == Mode::Ci {
+            builder.parents(false).git_global(false).git_exclude(false);
+        }
+        builder.filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            if entry.file_name() == ".git" {
+                return false;
+            }
+            if entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_dir())
+                && entry.path().join(".git").exists()
+            {
+                return false;
+            }
+            true
+        });
+
+        let mut entries = Vec::new();
+        for result in builder.build() {
+            match result {
+                Ok(entry) => entries.push(Ok(entry)),
+                Err(error) => {
+                    let path = walk_error_path(&error)
+                        .and_then(|path| path.strip_prefix(root).ok())
+                        .map(display_rel)
+                        .unwrap_or_default();
+                    entries.push(Err(Diagnostic {
+                        code: "walk-failed",
+                        path,
+                        rule: String::new(),
+                        message: error.to_string(),
+                    }));
+                }
+            }
+        }
+        entries
+    }
+}
+
+/// Best-effort path from a walker error; `ignore` 0.4 exposes it only via
+/// the `WithPath` variant, so the wrappers are peeled deterministically.
+fn walk_error_path(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithLineNumber { err, .. } => walk_error_path(err),
+        ignore::Error::WithDepth { err, .. } => walk_error_path(err),
+        ignore::Error::Partial(errors) => errors.iter().find_map(walk_error_path),
+        _ => None,
+    }
+}
+
+/// Builds a `.sentinelignore` matcher over every ignore file found by the
+/// walk, mirroring the walker's nested-file precedence when post-filtering
+/// tracked paths. Returns `None` when no `.sentinelignore` exists; unreadable
+/// or malformed files produce deterministic `sentinel-ignore-failed`
+/// diagnostics and the remaining rules still apply.
+fn sentinel_matcher(
+    root: &Path,
+    sentinel_ignores: &[PathBuf],
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Gitignore> {
+    if sentinel_ignores.is_empty() {
+        return None;
+    }
+    let mut builder = GitignoreBuilder::new(root);
+    for path in sentinel_ignores {
+        if let Some(error) = builder.add(path) {
+            let rel = path.strip_prefix(root).unwrap_or(path);
+            diagnostics.push(Diagnostic {
+                code: "sentinel-ignore-failed",
+                path: display_rel(rel),
+                rule: String::new(),
+                message: error.to_string(),
+            });
+        }
+    }
+    match builder.build() {
+        Ok(matcher) => Some(matcher),
+        Err(error) => {
+            diagnostics.push(Diagnostic {
+                code: "sentinel-ignore-failed",
+                path: ".sentinelignore".into(),
+                rule: String::new(),
+                message: error.to_string(),
+            });
+            None
+        }
+    }
+}
+
+/// Repo-relative path text with forward slashes on every platform, matching
+/// how git emits records and how the renderer displays findings.
+fn display_rel(rel: &Path) -> String {
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+/// Converts a stripped relative path to the shared `/`-separated record byte
+/// form used by [`is_safe_relative`].
+#[cfg(unix)]
+fn record_bytes(rel: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    rel.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn record_bytes(rel: &Path) -> Vec<u8> {
+    rel.to_string_lossy().replace('\\', "/").into_bytes()
 }
 
 /// Rejects absolute, parent-traversing, and empty-interior path records.
@@ -153,6 +429,32 @@ fn is_safe_relative(record: &[u8]) -> bool {
     record
         .split(|&byte| byte == b'/')
         .all(|part| !part.is_empty() && part != b"..")
+}
+
+/// Test-only: pins ambient-ignore environment so in-process walkers are
+/// hermetic. The `ignore` crate resolves global gitignore sources
+/// ($HOME/.gitconfig, XDG config, /etc/gitconfig) from the process
+/// environment at walk time; without pinning, a developer machine's global
+/// gitignore could change Local-mode test results. Runs once per test
+/// process; every in-process discovery call passes through it.
+#[cfg(test)]
+fn pin_test_ambient_env() {
+    use std::sync::Once;
+    static PINNED: Once = Once::new();
+    PINNED.call_once(|| {
+        let home = std::env::temp_dir().join(format!("sentinel-test-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        // SAFETY: test-only, executed once before any walker is built, and
+        // no other code in the test binary reads these variables. Empty
+        // values are treated as unset by the ignore crate; HOME points at a
+        // scratch directory without git configuration.
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", "");
+            std::env::set_var("GIT_CONFIG_SYSTEM", "sentinel-missing-system-config");
+            std::env::set_var("XDG_CONFIG_HOME", "");
+            std::env::set_var("HOME", &home);
+        }
+    });
 }
 
 #[cfg(windows)]
@@ -194,7 +496,7 @@ fn os_string(bytes: &[u8]) -> OsString {
 
 #[cfg(test)]
 mod tests {
-    use super::{Git, is_safe_relative};
+    use super::{Git, Mode, is_safe_relative};
     use crate::errors::Error;
     use crate::test_util::{temp_repo, write_tracked};
     use std::ffi::OsStr;
@@ -208,7 +510,7 @@ mod tests {
         let nested = root.join("a/b/c");
         std::fs::create_dir_all(&nested).unwrap();
 
-        let discovered = Git::new().discover(&nested).unwrap();
+        let discovered = Git::new().discover(&nested, Mode::Ci).unwrap();
         assert_eq!(discovered.root, root);
         assert_eq!(discovered.files, vec![PathBuf::from("top.txt")]);
     }
@@ -218,7 +520,7 @@ mod tests {
         let (_dir, root) = temp_repo();
         write_tracked(&root, OsStr::new("abs.txt"), b"x");
 
-        let discovered = Git::new().discover(&root).unwrap();
+        let discovered = Git::new().discover(&root, Mode::Ci).unwrap();
         assert_eq!(discovered.root, root);
         assert_eq!(discovered.files, vec![PathBuf::from("abs.txt")]);
     }
@@ -228,7 +530,7 @@ mod tests {
         let (_dir, root) = temp_repo();
         write_tracked(&root, OsStr::new("-C"), b"contents");
 
-        let discovered = Git::new().discover(&root).unwrap();
+        let discovered = Git::new().discover(&root, Mode::Ci).unwrap();
         assert_eq!(discovered.files, vec![PathBuf::from("-C")]);
     }
 
@@ -237,11 +539,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let missing = dir.path().join("does-not-exist");
         assert!(matches!(
-            Git::new().discover(&missing).unwrap_err(),
+            Git::new().discover(&missing, Mode::Ci).unwrap_err(),
             Error::InvalidWorkingDirectory { .. }
         ));
         assert!(matches!(
-            Git::new().discover(dir.path()).unwrap_err(),
+            Git::new().discover(dir.path(), Mode::Ci).unwrap_err(),
             Error::NotARepository { .. }
         ));
         let (_dir, root) = temp_repo();
@@ -249,7 +551,7 @@ mod tests {
             program: PathBuf::from("/definitely/not/git"),
         };
         assert!(matches!(
-            git.discover(&root).unwrap_err(),
+            git.discover(&root, Mode::Ci).unwrap_err(),
             Error::GitUnavailable { .. }
         ));
     }
@@ -268,7 +570,7 @@ mod tests {
 
         let mut expected: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
         expected.sort();
-        let discovered = Git::new().discover(&root).unwrap();
+        let discovered = Git::new().discover(&root, Mode::Ci).unwrap();
         assert_eq!(discovered.files, expected);
     }
 
@@ -280,7 +582,7 @@ mod tests {
         let name = OsStr::from_bytes(b"bad-\xff-name.txt");
         write_tracked(&root, name, b"payload");
 
-        let discovered = Git::new().discover(&root).unwrap();
+        let discovered = Git::new().discover(&root, Mode::Ci).unwrap();
         assert_eq!(discovered.files, vec![PathBuf::from(name)]);
     }
 
@@ -293,7 +595,7 @@ mod tests {
         symlink("target.txt", root.join("link.txt")).unwrap();
         crate::test_util::git(&root, ["add", "--", "target.txt", "link.txt"]);
 
-        let discovered = Git::new().discover(&root).unwrap();
+        let discovered = Git::new().discover(&root, Mode::Ci).unwrap();
         assert_eq!(discovered.files, vec![PathBuf::from("target.txt")]);
     }
 
@@ -304,8 +606,8 @@ mod tests {
         write_tracked(&root, OsStr::new("a.txt"), b"2");
 
         let git = Git::new();
-        let first = git.discover(&root).unwrap();
-        let second = git.discover(&root).unwrap();
+        let first = git.discover(&root, Mode::Ci).unwrap();
+        let second = git.discover(&root, Mode::Ci).unwrap();
         assert_eq!(first, second);
         assert_eq!(
             first.files,

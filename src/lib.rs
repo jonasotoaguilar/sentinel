@@ -52,19 +52,31 @@ fn run_inner(
             return ExitCode::from(errors::EXIT_OPERATIONAL);
         }
     };
-    let Command::Scan = cli.command;
+    let Command::Scan { ci } = cli.command;
+    let mode = if ci {
+        discovery::Mode::Ci
+    } else {
+        discovery::Mode::Local
+    };
 
-    let discovered = match discovery::Git::new().discover(cwd) {
+    let discovered = match discovery::Git::new().discover(cwd, mode) {
         Ok(discovered) => discovered,
         Err(error) => {
             let _ = writeln!(stderr, "sentinel: {error}");
             return ExitCode::from(errors::EXIT_OPERATIONAL);
         }
     };
-    let Discovered { root, files } = discovered;
+    let Discovered {
+        root,
+        files,
+        diagnostics: discovery_diagnostics,
+    } = discovered;
 
-    // Engine-local rule failures warn once and never abort the scan.
+    // Engine-local rule failures warn once and never abort the scan;
+    // discovery diagnostics (skipped-large, walk-failed, invalid-path, ...)
+    // merge before the deterministic renderer.
     let mut diagnostics = engine.init_diagnostics().to_vec();
+    diagnostics.extend(discovery_diagnostics);
 
     let scans = files
         .par_iter()
@@ -250,7 +262,6 @@ mod tests {
         for args in [
             &["scan", "--explain"][..],
             &["scan", "--output", "json"],
-            &["scan", "--ci"],
             &["scan", "file.txt"],
             &["scan", "--help"],
             &["scan", "--version"],

@@ -1,8 +1,8 @@
 //! Command-line surface: exactly one command, `sentinel scan`.
 //!
 //! clap owns parsing; every rejected invocation is a usage error (stderr
-//! diagnostics, empty stdout, exit 2). No future flags or stubs: anything
-//! beyond `scan` is rejected, so `--explain`, `--output`, `--ci`, and
+//! diagnostics, empty stdout, exit 2). `--ci` is the only supported option;
+//! anything else beyond `scan` is rejected, so `--explain`, `--output`, and
 //! positional arguments cannot silently become no-ops.
 
 use clap::{Parser, Subcommand};
@@ -25,7 +25,12 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Scan the current Git repository for secrets.
-    Scan,
+    Scan {
+        /// Run with hermetic (CI) ignore sources: parent, global, and
+        /// `.git/info/exclude` ambient ignores are disabled.
+        #[arg(long)]
+        ci: bool,
+    },
 }
 
 /// Parses the raw argument list. Usage errors return a clap error that the
@@ -53,7 +58,6 @@ mod tests {
         for tokens in [
             &["scan", "--explain"][..],
             &["scan", "--output", "json"],
-            &["scan", "--ci"],
             &["scan", "some-file.txt"],
             &["scan", "--help"],
             &["scan", "--version"],

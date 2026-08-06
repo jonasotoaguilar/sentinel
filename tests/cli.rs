@@ -192,7 +192,6 @@ fn unsupported_arguments_and_missing_subcommand_write_stderr_only_and_exit_2() {
         vec!["--explain"],
         vec!["scan", "--explain"],
         vec!["scan", "--output", "json"],
-        vec!["scan", "--ci"],
         vec!["scan", "file.txt"],
     ] {
         let (code, stdout, stderr) = scan_seam_in(&args, dir.path());
