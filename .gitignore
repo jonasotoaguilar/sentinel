@@ -1,0 +1,23 @@
+# Environment and editor files
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local tooling scratch data
+.atl/
+
+# Rust build artifacts
+/target/
+
+# Generated reports (CI and local runs)
+lcov.info
+clippy.sarif
+.agents
+.claude

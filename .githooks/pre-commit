@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+# Bootstrap state: no crate manifest yet, nothing to check.
+# The hook activates automatically once Cargo.toml lands.
+if [ ! -f Cargo.toml ]; then
+  echo "pre-commit: no Cargo.toml yet (bootstrap state) - skipping cargo hooks"
+  exit 0
+fi
+
+# Only touch commits that actually change Rust files.
+staged_rust_files="$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')"
+if [ -z "$staged_rust_files" ]; then
+  exit 0
+fi
+
+echo "pre-commit: checking formatting"
+cargo fmt --all -- --check
+
+echo "pre-commit: linting staged Rust files"
+cargo clippy --all-targets --all-features -- -D warnings
+
+echo "pre-commit: ok"
