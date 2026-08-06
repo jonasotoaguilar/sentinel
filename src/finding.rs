@@ -1,11 +1,6 @@
 //! The canonical finding and diagnostic model (finding-normalization spec):
 //! engines emit raw detections; normalization collapses them into [`Finding`]
 //! values with stable fingerprints; [`Diagnostic`] models stderr warnings.
-//!
-//! PR2 creates the model; the secrets engine, normalization, and renderer that
-//! consume it land in PR3, so the model is still dead code in this increment.
-
-#![expect(dead_code)]
 
 /// Severity assigned by a rule (ARCHITECTURE findings model).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
