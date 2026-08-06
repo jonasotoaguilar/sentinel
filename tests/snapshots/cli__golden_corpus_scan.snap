@@ -1,0 +1,13 @@
+---
+source: tests/cli.rs
+expression: text_of(&multi.stdout)
+---
+config.env:2:12: critical SECRET-aws-access-key: AWS access key ID detected
+  aws_key = "[REDACTED]"
+  evidence: [REDACTED]
+config.env:3:9: medium SECRET-synthetic-token: synthetic secret token detected
+  token = [REDACTED]
+  evidence: [REDACTED]
+settings/app.conf:2:9: medium SECRET-synthetic-token: synthetic secret token detected
+  token = [REDACTED]
+  evidence: [REDACTED]
