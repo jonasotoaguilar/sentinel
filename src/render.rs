@@ -9,7 +9,9 @@ use std::io::Write;
 use crate::finding::{Diagnostic, Finding};
 
 mod json;
+mod sarif;
 pub use json::render_json;
+pub use sarif::render_sarif;
 
 /// Renders the findings report; the only content ever written to stdout.
 pub fn render_findings(findings: &[Finding]) -> Vec<u8> {

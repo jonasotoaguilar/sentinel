@@ -102,14 +102,20 @@ fn run_inner(
     // Report formats render first, then write to stdout or the requested file.
     let report_bytes = match output {
         OutputFormat::Terminal => render::render_findings(&findings),
-        // PR1: JSON is the machine-readable report; the SARIF renderer is PR2.
-        OutputFormat::Json | OutputFormat::Sarif => match render::render_json(&findings) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                let _ = writeln!(stderr, "sentinel: cannot render scan report: {error}");
-                return ExitCode::from(errors::EXIT_OPERATIONAL);
+        OutputFormat::Json | OutputFormat::Sarif => {
+            let rendered = match output {
+                OutputFormat::Json => render::render_json(&findings),
+                OutputFormat::Sarif => render::render_sarif(&findings),
+                OutputFormat::Terminal => unreachable!(),
+            };
+            match rendered {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let _ = writeln!(stderr, "sentinel: cannot render scan report: {error}");
+                    return ExitCode::from(errors::EXIT_OPERATIONAL);
+                }
             }
-        },
+        }
     };
 
     let written = match report.as_deref().map(|path| cwd.join(path)) {
