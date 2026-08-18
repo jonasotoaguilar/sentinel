@@ -43,19 +43,19 @@ Chain strategy: stacked-to-main
 
 ## Phase 3: SARIF renderer + URI (PR 2)
 
-- [ ] 3.1 `Cargo.toml`/lock: add `percent-encoding = "2"`, dev `jsonschema = { version = "0.49", default-features = false }`
-- [ ] 3.2 RED `src/render/sarif.rs` units: 2.1.0 envelope, sorted unique rules + matching `rule.index`, severity map LOW→note/MEDIUM→warning/HIGH+CRITICAL→error, empty results valid
-- [ ] 3.3 RED `src/render/sarif.rs` units: RFC 3986 percent-encoding of space, `#`, `%`, non-ASCII; `/` preserved
-- [ ] 3.4 GREEN `src/render/sarif.rs`: URI encoder via `percent-encoding = "2"` (pass `/` + unreserved)
-- [ ] 3.5 GREEN `src/render/sarif.rs`: DTOs, sorted rule vector, binary-search index; `render_sarif(&[Finding]) -> Result<Vec<u8>, serde_json::Error>`; no I/O
-- [ ] 3.6 GREEN `src/lib.rs` + `src/render.rs`: route `--output sarif`; re-export renderers; terminal bytes byte-identical
+- [x] 3.1. `Cargo.toml`/lock: add `percent-encoding = "2"`, dev `jsonschema = { version = "0.49", default-features = false }`
+- [x] 3.2. RED `src/render/sarif.rs` units: 2.1.0 envelope, sorted unique rules + matching `rule.index`, severity map LOW→note/MEDIUM→warning/HIGH+CRITICAL→error, empty results valid
+- [x] 3.3. RED `src/render/sarif.rs` units: RFC 3986 percent-encoding of space, `#`, `%`, non-ASCII; `/` preserved
+- [x] 3.4. GREEN `src/render/sarif.rs`: URI encoder via `percent-encoding = "2"` (pass `/` + unreserved)
+- [x] 3.5. GREEN `src/render/sarif.rs`: DTOs, sorted rule vector, binary-search index; `render_sarif(&[Finding]) -> Result<Vec<u8>, serde_json::Error>`; no I/O
+- [x] 3.6. GREEN `src/lib.rs` + `src/render.rs`: route `--output sarif`; re-export renderers; terminal bytes byte-identical
 
 ## Phase 4: Hermetic schema, goldens, verification (PR 2)
 
-- [ ] 4.1 Add `tests/fixtures/sarif-2.1.0.schema.json`: minified pinned official OASIS 2.1.0 schema (fixture, excluded from authored budget)
-- [ ] 4.2 `tests/reporting.rs`: validate SARIF via `jsonschema::draft7::new` (resolution disabled) → offline pass; run-twice byte-identical
-- [ ] 4.3 Add `tests/snapshots/reporting__*.snap` JSON/SARIF insta goldens; leave `cli__golden_corpus_scan.snap` untouched
-- [ ] 4.4 Verify: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`, `cargo deny check`; terminal golden unchanged
+- [x] 4.1. Add `tests/fixtures/sarif-2.1.0.schema.json`: minified pinned official OASIS 2.1.0 schema (fixture, excluded from authored budget)
+- [x] 4.2. `tests/reporting.rs`: validate SARIF via `jsonschema::draft7::new` (resolution disabled) → offline pass; run-twice byte-identical
+- [x] 4.3. Add `tests/snapshots/reporting__*.snap` JSON/SARIF insta goldens; leave `cli__golden_corpus_scan.snap` untouched
+- [x] 4.4. Verify: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`, `cargo deny check`; terminal golden unchanged
 
 ## Notes
 

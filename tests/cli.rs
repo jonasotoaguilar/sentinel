@@ -587,6 +587,10 @@ fn repeated_json_runs_are_byte_identical() {
 fn fixture_corpus_is_synthetic_only() {
     let mut audited = 0;
     for path in walk_files(&fixture_root()) {
+        // The pinned SARIF schema is not a secret-detection corpus file.
+        if path.ends_with("sarif-2.1.0.schema.json") {
+            continue;
+        }
         audited += 1;
         let text = text_of(&std::fs::read(&path).unwrap());
         assert!(
