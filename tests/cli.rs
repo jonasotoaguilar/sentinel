@@ -191,7 +191,6 @@ fn unsupported_arguments_and_missing_subcommand_write_stderr_only_and_exit_2() {
         Vec::new(),
         vec!["--explain"],
         vec!["scan", "--explain"],
-        vec!["scan", "--output", "json"],
         vec!["scan", "file.txt"],
     ] {
         let (code, stdout, stderr) = scan_seam_in(&args, dir.path());
@@ -459,6 +458,122 @@ fn scan_leaves_repo_paths_and_mtimes_unchanged() {
         before, after,
         "scan must not write, modify, or create files"
     );
+}
+
+// ---------------------------------------------------------------------------
+// cli-scan: output/report routing (PR1; tasks 1.1-1.3 RED, then production)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn invalid_output_or_terminal_with_report_is_a_usage_error() {
+    let dir = TempDir::new().unwrap(); // usage fails before discovery
+    for args in [
+        vec!["scan", "--output", "yaml"],
+        vec!["scan", "--output", "terminal", "--report", "out.json"],
+        vec!["scan", "--report", "out.json"], // default output is terminal
+    ] {
+        let (code, stdout, stderr) = scan_seam_in(&args, dir.path());
+        assert_eq!(code, ExitCode::from(2), "args {args:?}");
+        assert!(stdout.is_empty(), "args {args:?}: stdout must stay empty");
+        assert!(
+            !stderr.is_empty(),
+            "args {args:?}: stderr must carry the usage error"
+        );
+    }
+}
+
+#[test]
+fn unwritable_report_path_exits_two_with_write_diagnostic() {
+    let (_dir, root) = golden_repo();
+    // A regular file blocks its child path on every host, root included.
+    let blocker_dir = TempDir::new().unwrap();
+    let blocker = blocker_dir.path().join("blocker");
+    std::fs::write(&blocker, b"x").unwrap();
+    let report = blocker.join("out.sarif");
+    let report_str = report.to_str().unwrap();
+
+    let (code, stdout, stderr) = scan_seam_in(
+        &["scan", "--output", "sarif", "--report", report_str],
+        &root,
+    );
+    assert_eq!(code, ExitCode::from(2));
+    assert!(stdout.is_empty());
+    assert!(
+        text_of(&stderr).contains("cannot write scan report"),
+        "stderr: {}",
+        text_of(&stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// machine-readable-reporting: --output json (PR1; tasks 2.4, 2.6)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn json_output_emits_complete_envelope_with_sorted_findings() {
+    let (_dir, root) = golden_repo();
+    let (code, stdout, stderr) = scan_seam_in(&["scan", "--output", "json"], &root);
+    assert_eq!(code, ExitCode::from(1));
+    assert!(stderr.is_empty());
+
+    let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(report["schema_version"], "1.0.0");
+    assert_eq!(report["tool"]["name"], "sentinel");
+    assert_eq!(report["tool"]["version"], env!("CARGO_PKG_VERSION"));
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 3);
+    let paths: Vec<&str> = findings
+        .iter()
+        .map(|f| f["location"]["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["config.env", "config.env", "settings/app.conf"]);
+    for finding in findings {
+        assert!(matches!(
+            finding["severity"].as_str(),
+            Some("low" | "medium" | "high" | "critical")
+        ));
+    }
+    // Redaction at the report boundary: raw values never enter the bytes.
+    let text = text_of(&stdout);
+    assert!(!text.contains(AWS_KEY) && !text.contains(TOKEN));
+}
+
+#[test]
+fn clean_repo_emits_empty_findings_array_and_exit_zero() {
+    let (_dir, root) = temp_repo();
+    track_fixture(&root, "clean/README.md", "README.md");
+    let (code, stdout, stderr) = scan_seam_in(&["scan", "--output", "json"], &root);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert!(stderr.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(report["findings"], serde_json::json!([]));
+}
+
+#[test]
+fn report_file_is_written_with_empty_stdout_and_exit_one() {
+    let (_dir, root) = golden_repo();
+    let report = root.join("out.json");
+    let (code, stdout, stderr) =
+        scan_seam_in(&["scan", "--output", "json", "--report", "out.json"], &root);
+    assert_eq!(code, ExitCode::from(1));
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    assert_eq!(value["findings"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn repeated_json_runs_are_byte_identical() {
+    let (_dir, root) = golden_repo();
+    let first = scan_seam_in(&["scan", "--output", "json"], &root);
+    let second = scan_seam_in(&["scan", "--output", "json"], &root);
+    assert_eq!(first.0, second.0);
+    assert_eq!(
+        first.1, second.1,
+        "json bytes must be identical across runs"
+    );
+    assert_eq!(first.2, second.2);
 }
 
 // ---------------------------------------------------------------------------

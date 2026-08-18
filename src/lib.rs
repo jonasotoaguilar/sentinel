@@ -17,7 +17,7 @@ use std::process::ExitCode;
 
 use rayon::prelude::*;
 
-use cli::Command;
+use cli::{Command, OutputFormat};
 use discovery::Discovered;
 use engine::secrets::SecretsEngine;
 use finding::Diagnostic;
@@ -52,7 +52,7 @@ fn run_inner(
             return ExitCode::from(errors::EXIT_OPERATIONAL);
         }
     };
-    let Command::Scan { ci } = cli.command;
+    let Command::Scan { ci, output, report } = cli.command;
     let mode = if ci {
         discovery::Mode::Ci
     } else {
@@ -98,10 +98,29 @@ fn run_inner(
     let findings = normalize::dedupe_and_sort(findings);
 
     let _ = stderr.write_all(&render::render_diagnostics(&diagnostics));
-    if let Err(error) = stdout.write_all(&render::render_findings(&findings)) {
+
+    // Report formats render first, then write to stdout or the requested file.
+    let report_bytes = match output {
+        OutputFormat::Terminal => render::render_findings(&findings),
+        // PR1: JSON is the machine-readable report; the SARIF renderer is PR2.
+        OutputFormat::Json | OutputFormat::Sarif => match render::render_json(&findings) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = writeln!(stderr, "sentinel: cannot render scan report: {error}");
+                return ExitCode::from(errors::EXIT_OPERATIONAL);
+            }
+        },
+    };
+
+    let written = match report.as_deref().map(|path| cwd.join(path)) {
+        Some(path) => std::fs::write(path, &report_bytes),
+        None => stdout.write_all(&report_bytes),
+    };
+    if let Err(error) = written {
         let _ = writeln!(stderr, "sentinel: cannot write scan report: {error}");
         return ExitCode::from(errors::EXIT_OPERATIONAL);
     }
+
     if findings.is_empty() {
         ExitCode::SUCCESS
     } else {
@@ -175,16 +194,25 @@ mod tests {
     }
 
     #[test]
-    fn failing_rule_warns_on_stderr_but_scan_completes_with_findings() {
+    fn failing_rule_diagnostic_stays_on_stderr_and_out_of_the_report_file() {
         let (_dir, root) = secret_repo();
-        let args = vec!["scan".to_string()];
+        let report = root.join("out.json");
+        let args: Vec<String> = ["scan", "--output", "json", "--report", "out.json"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = run_inner(&broken_rule_engine(), &args, &root, &mut out, &mut err);
         assert_eq!(code, ExitCode::from(1));
-        let out_text = String::from_utf8(out).unwrap();
+        assert!(out.is_empty(), "stdout stays empty with --report");
         let err_text = String::from_utf8(err).unwrap();
         assert!(err_text.contains("rule-failed") && err_text.contains("SECRET-broken"));
-        assert!(out_text.contains("SECRET-aws-access-key") && !out_text.contains("rule-failed"));
+        let report_text = String::from_utf8(std::fs::read(&report).unwrap()).unwrap();
+        assert!(
+            !report_text.contains("rule-failed"),
+            "diagnostic must never enter report bytes"
+        );
+        assert!(report_text.contains("SECRET-aws-access-key"));
     }
 
     #[test]
@@ -261,7 +289,6 @@ mod tests {
     fn unsupported_flag_writes_usage_to_stderr_and_exits_two() {
         for args in [
             &["scan", "--explain"][..],
-            &["scan", "--output", "json"],
             &["scan", "file.txt"],
             &["scan", "--help"],
             &["scan", "--version"],
