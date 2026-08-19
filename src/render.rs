@@ -1,9 +1,15 @@
 //! Pure deterministic rendering: findings → stdout bytes, diagnostics →
 //! stderr bytes (terminal-rendering spec). No timestamps, ANSI escapes,
 //! targets, or thread ids — pure functions of the scan result.
+//!
+//! `json` (PR1) and `sarif` (PR2) are pure sub-renderers at the same
+//! boundary; terminal rendering below stays byte-identical.
 use std::io::Write;
 
 use crate::finding::{Diagnostic, Finding};
+
+mod json;
+pub use json::render_json;
 
 /// Renders the findings report; the only content ever written to stdout.
 pub fn render_findings(findings: &[Finding]) -> Vec<u8> {
