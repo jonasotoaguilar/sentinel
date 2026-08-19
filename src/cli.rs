@@ -1,11 +1,13 @@
 //! Command-line surface: exactly one command, `sentinel scan`.
 //!
 //! clap owns parsing; every rejected invocation is a usage error (stderr
-//! diagnostics, empty stdout, exit 2). `--ci` is the only supported option;
-//! anything else beyond `scan` is rejected, so `--explain`, `--output`, and
+//! diagnostics, empty stdout, exit 2). `--ci`, `--output`, and `--report` are
+//! the only supported options; anything else is rejected, so `--explain` and
 //! positional arguments cannot silently become no-ops.
 
-use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// Sentinel — deterministic secrets scanner for Git repositories.
 #[derive(Debug, Parser)]
@@ -30,13 +32,41 @@ pub enum Command {
         /// `.git/info/exclude` ambient ignores are disabled.
         #[arg(long)]
         ci: bool,
+        /// Report format: terminal, json, or sarif (default terminal).
+        #[arg(long, value_enum, default_value = "terminal")]
+        output: OutputFormat,
+        /// Write the machine-readable report to a file instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        report: Option<PathBuf>,
     },
 }
 
+/// The accepted `--output` values (cli-scan spec: exactly these three).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    Terminal,
+    Json,
+    Sarif,
+}
+
 /// Parses the raw argument list. Usage errors return a clap error that the
-/// caller renders to stderr and maps to exit code 2.
+/// caller renders to stderr and maps to exit code 2. The report/target
+/// conflict is a post-parse check so clap keeps owning the error shape.
 pub fn parse(args: &[String]) -> Result<Cli, clap::Error> {
-    Cli::try_parse_from(std::iter::once("sentinel").chain(args.iter().map(String::as_str)))
+    let cli =
+        Cli::try_parse_from(std::iter::once("sentinel").chain(args.iter().map(String::as_str)))?;
+    if let Command::Scan {
+        output: OutputFormat::Terminal,
+        report: Some(_),
+        ..
+    } = &cli.command
+    {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "the argument '--report <PATH>' cannot be used with '--output terminal'",
+        ));
+    }
+    Ok(cli)
 }
 
 #[cfg(test)]
@@ -51,20 +81,19 @@ mod tests {
     #[test]
     fn scan_subcommand_is_accepted() {
         let cli = parse(&args(&["scan"])).unwrap();
-        assert!(matches!(cli.command, Command::Scan { ci: false }));
+        assert!(matches!(cli.command, Command::Scan { ci: false, .. }));
     }
 
     #[test]
     fn ci_flag_parses_to_scan_with_ci_true() {
         let cli = parse(&args(&["scan", "--ci"])).unwrap();
-        assert!(matches!(cli.command, Command::Scan { ci: true }));
+        assert!(matches!(cli.command, Command::Scan { ci: true, .. }));
     }
 
     #[test]
     fn unsupported_arguments_are_usage_errors() {
         for tokens in [
             &["scan", "--explain"][..],
-            &["scan", "--output", "json"],
             &["scan", "some-file.txt"],
             &["scan", "--help"],
             &["scan", "--version"],
