@@ -1,0 +1,23 @@
+change: sentinel-discovery-hardening
+phase: apply
+artifact_store: hybrid
+execution_mode: auto
+delivery_strategy: auto-chain
+chain_strategy: stacked-to-main
+review_budget_lines: 800
+current_work_unit: slice-a
+runtime_status: terminal_stopped
+stop_reason: maintainer chose to stop after Slice A
+artifacts:
+  explore: true
+  proposal: true
+  spec: true
+  design: true
+  tasks: true
+  apply_progress: true
+  verify_report: false
+  archive_report: false
+tasks_progress:
+  completed: [1.1, 1.2, 1.3, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 3.1, 3.2]
+  pending: [4.1, 4.2, 4.3, 4.4, 4.5, 5.1]
+last_updated: 2026-08-05
