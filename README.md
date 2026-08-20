@@ -35,8 +35,11 @@ Sentinel runs a scan over a Git repository and reports findings in a reviewable 
 Sentinel is **not yet installable** — there is no published crate and no `Cargo.toml` in this repository. Installation instructions will live here once the binary crate exists. The intended usage looks like this:
 
 ```bash
-# Scan the current repository (git-aware discovery)
+# Scan the current repository (git-aware discovery: tracked + untracked files, ignore-aware)
 sentinel scan
+
+# Hermetic CI scan: ignores parent/global gitignore sources; repository-local rules only
+sentinel scan --ci
 
 # Write SARIF 2.1.0 for CI ingestion
 sentinel scan --output sarif --report sentinel.sarif
