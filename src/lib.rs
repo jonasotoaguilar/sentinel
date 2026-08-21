@@ -8,6 +8,7 @@ mod engine;
 mod errors;
 mod finding;
 mod normalize;
+pub mod osv;
 mod render;
 #[cfg(test)]
 mod test_util;
