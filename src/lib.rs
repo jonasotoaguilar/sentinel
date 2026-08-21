@@ -1,6 +1,7 @@
 //! Sentinel — a deterministic Git secrets scanner. The public seam is [`run`]:
 //! the binary forwards argv, cwd, and locked stdio.
 
+mod cache;
 mod cli;
 mod discovery;
 mod engine;
