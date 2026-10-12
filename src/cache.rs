@@ -39,6 +39,8 @@ impl XdgCache {
     pub fn get_offline(&self, e: &str, n: &str, v: &str) -> Option<Vec<u8>> {
         self.get_inner(e, n, v, true)
     }
+    #[rustfmt::skip]    pub(crate) fn entry_present(&self,e:&str,n:&str,v:&str)->bool{let Some(base)=self.base.as_ref()else{return false;};if !Self::is_valid_eco(e)||!Self::is_valid_name(n,e)||!Self::is_valid_ver(v){return false;}let Some(path)=self.cache_path(base,e,n,v)else{return false;};if !path.starts_with(base)||is_symlink(&path)||has_symlink_ancestor(base,&path){return false;}if path.parent().is_some_and(|p|p.exists())&&!canon_contained(base,&path){return false;}std::fs::symlink_metadata(&path).is_ok_and(|m|m.file_type().is_file())}
+    #[rustfmt::skip]    pub(crate) fn entry_path(&self,e:&str,n:&str,v:&str)->Option<PathBuf>{let base=self.base.as_ref()?;self.cache_path(base,e,n,v)}
     pub fn put(&self, e: &str, n: &str, v: &str, d: &[u8]) -> std::io::Result<bool> {
         let Some(base) = self.base.as_ref() else {
             return Ok(false);
