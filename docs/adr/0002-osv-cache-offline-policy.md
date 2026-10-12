@@ -102,6 +102,7 @@ The product rule "offline serves from cache and warns/skips gracefully" forces a
 
 ## Action Items
 1. [ ] Confirm the 24 h TTL default during implementation planning (configurable knob if product wants it).
+2. [x] Confirmed: 24 h TTL is `TTL` in `src/cache.rs`; no cache/offline environment knob exists.
 
 ## References
 - PRD §3 (OSV API v1 in scope), §4 (offline product rule), §6 (pagination/detail-fetch research constraint)
