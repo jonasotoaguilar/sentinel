@@ -1,9 +1,9 @@
 //! Command-line surface: exactly one command, `sentinel scan`.
 //!
 //! clap owns parsing; every rejected invocation is a usage error (stderr
-//! diagnostics, empty stdout, exit 2). `--ci`, `--output`, and `--report` are
-//! the only supported options; anything else is rejected, so `--explain` and
-//! positional arguments cannot silently become no-ops.
+//! diagnostics, empty stdout, exit 2). `--ci`, `--offline`, `--output`, and
+//! `--report` are the only supported options; anything else is rejected, so
+//! `--explain` and positional arguments cannot silently become no-ops.
 
 use std::path::PathBuf;
 
@@ -32,6 +32,9 @@ pub enum Command {
         /// `.git/info/exclude` ambient ignores are disabled.
         #[arg(long)]
         ci: bool,
+        /// Disable network and cache writes; use any-age cache only.
+        #[arg(long)]
+        offline: bool,
         /// Report format: terminal, json, or sarif (default terminal).
         #[arg(long, value_enum, default_value = "terminal")]
         output: OutputFormat,
@@ -73,23 +76,42 @@ pub fn parse(args: &[String]) -> Result<Cli, clap::Error> {
 mod tests {
     use super::{Command, parse};
     use clap::error::ErrorKind;
-
     fn args(tokens: &[&str]) -> Vec<String> {
         tokens.iter().map(|s| s.to_string()).collect()
     }
-
     #[test]
     fn scan_subcommand_is_accepted() {
         let cli = parse(&args(&["scan"])).unwrap();
         assert!(matches!(cli.command, Command::Scan { ci: false, .. }));
     }
-
     #[test]
     fn ci_flag_parses_to_scan_with_ci_true() {
         let cli = parse(&args(&["scan", "--ci"])).unwrap();
         assert!(matches!(cli.command, Command::Scan { ci: true, .. }));
     }
-
+    #[test]
+    fn offline_is_orthogonal_to_ci() {
+        let cli = parse(&args(&["scan", "--offline"])).unwrap();
+        assert!(matches!(cli.command, Command::Scan { offline: true, .. }));
+        let cli = parse(&args(&["scan", "--ci", "--offline"])).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Scan {
+                ci: true,
+                offline: true,
+                ..
+            }
+        ));
+        let cli = parse(&args(&["scan", "--offline", "--ci"])).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Scan {
+                ci: true,
+                offline: true,
+                ..
+            }
+        ));
+    }
     #[test]
     fn unsupported_arguments_are_usage_errors() {
         for tokens in [
@@ -102,7 +124,6 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{tokens:?}");
         }
     }
-
     #[test]
     fn missing_subcommand_is_a_usage_error() {
         let err = parse(&[]).unwrap_err();
