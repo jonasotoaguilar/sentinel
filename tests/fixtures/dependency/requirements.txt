@@ -1,0 +1,3 @@
+# SYNTHETIC FIXTURE - pinned PyPI slice with one unpinned line for offline dependency E2E.
+flask==2.3.3
+requests>=2.0

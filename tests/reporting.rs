@@ -165,3 +165,20 @@ fn json_golden_matches_reviewable_snapshot() {
     assert_eq!(code, ExitCode::from(1));
     insta::assert_snapshot!("json_golden_corpus", text_of(&stdout));
 }
+
+#[test]
+fn offline_json_output_reports_secret_findings_without_diagnostics() {
+    let (_dir, root) = golden_repo();
+    let (code, stdout, stderr) = scan(&["scan", "--offline", "--output", "json"], &root);
+    assert_eq!(code, ExitCode::from(1), "--offline is accepted");
+    assert!(stderr.is_empty(), "no manifests, no dependency diagnostics");
+    let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 3);
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding["engine"] == "secrets"),
+        "offline-only repo carries secrets findings only"
+    );
+}
