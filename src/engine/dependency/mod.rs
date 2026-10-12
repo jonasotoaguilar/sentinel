@@ -96,7 +96,8 @@ impl DependencyEngine {
                         .collect();
                     let deadline = Instant::now() + NETWORK_BUDGET;
                     match osv.query_all_with_deadline(&queries, deadline) {
-                        Ok(results) if !results.is_empty() => {
+                        Ok((results, batch_diags)) => {
+                            diags.extend(batch_diags);
                             for (pin, advs) in pending.iter().zip(results.iter()) {
                                 if let Some(c) = cache.as_ref() {
                                     let vals: Vec<serde_json::Value> = advs
@@ -122,7 +123,6 @@ impl DependencyEngine {
                                 }
                             }
                         }
-                        Ok(_) => {}
                         Err(e) => {
                             let san = crate::finding::sanitize(&e);
                             for pin in &pending {
@@ -294,12 +294,71 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn invalid_advisory_skips_with_a_diagnostic_and_valid_siblings_emit() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("package-lock.json"),
+            r#"{"packages":{"node_modules/lodash":{"version":"4.17.20"}}}"#,
+        )
+        .unwrap();
+        let stub = crate::osv::client::StubOsv::new(vec![(
+            vec![
+                serde_json::json!({"vulns":[{"id":"<script>alert(1)</script>"},{"id":"GHSA-OK1","severity":[{"type":"CVSS_V3","score":"9.8"}]}]}),
+            ],
+            None,
+        )]);
+        let cache = XdgCache::with_root(tempfile::tempdir().unwrap().path().to_path_buf());
+        let (findings, diags) = DependencyEngine::online(Some(cache), Box::new(stub))
+            .review(root.path(), &[PathBuf::from("package-lock.json")]);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].rule_id, "OSV-GHSA-OK1");
+        let invalid: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == "advisory-invalid")
+            .collect();
+        assert_eq!(invalid.len(), 1, "{diags:?}");
+        assert!(!invalid[0].message.contains("<script>"), "{:?}", invalid[0]);
+        assert!(
+            invalid[0].message.contains("lodash@4.17.20"),
+            "{:?}",
+            invalid[0]
+        );
+    }
+
+    #[test]
+    fn cached_invalid_advisory_warns_without_emitting_a_finding() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("package-lock.json"),
+            r#"{"packages":{"node_modules/lodash":{"version":"4.17.20"}}}"#,
+        )
+        .unwrap();
+        let cache = XdgCache::with_root(tempfile::tempdir().unwrap().path().to_path_buf());
+        cache
+            .put(
+                "npm",
+                "lodash",
+                "4.17.20",
+                br#"[{"id":"<script>alert(1)</script>"}]"#,
+            )
+            .unwrap();
+        let stub = crate::osv::client::StubOsv::new(vec![(vec![], None)]);
+        let (findings, diags) = DependencyEngine::online(Some(cache), Box::new(stub))
+            .review(root.path(), &[PathBuf::from("package-lock.json")]);
+        assert!(findings.is_empty(), "{findings:?}");
+        assert!(
+            diags.iter().any(|d| d.code == "advisory-invalid"),
+            "{diags:?}"
+        );
+    }
+
     struct FailOsv;
     impl crate::osv::client::OsvApi for FailOsv {
         fn query_all(
             &self,
             _qs: &[crate::osv::client::Query],
-        ) -> Result<Vec<Vec<crate::osv::validate::Advisory>>, String> {
+        ) -> Result<(Vec<Vec<crate::osv::validate::Advisory>>, Vec<Diagnostic>), String> {
             Err("network failure".into())
         }
         fn vuln(&self, _id: &str) -> Result<crate::osv::validate::Advisory, String> {
@@ -311,7 +370,7 @@ mod tests {
         fn query_all(
             &self,
             qs: &[crate::osv::client::Query],
-        ) -> Result<Vec<Vec<crate::osv::validate::Advisory>>, String> {
+        ) -> Result<(Vec<Vec<crate::osv::validate::Advisory>>, Vec<Diagnostic>), String> {
             self.0.query_all(qs)
         }
         fn vuln(&self, id: &str) -> Result<crate::osv::validate::Advisory, String> {
@@ -321,7 +380,7 @@ mod tests {
             &self,
             qs: &[crate::osv::client::Query],
             deadline: Instant,
-        ) -> Result<Vec<Vec<crate::osv::validate::Advisory>>, String> {
+        ) -> Result<(Vec<Vec<crate::osv::validate::Advisory>>, Vec<Diagnostic>), String> {
             self.0.query_all_with_deadline(qs, deadline)
         }
         fn vuln_with_deadline(
