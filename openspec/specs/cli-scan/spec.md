@@ -2,87 +2,69 @@
 
 ## Purpose
 
-`sentinel scan` is the sole MVP command: a fixed pipeline (discovery → engines → normalize → render), mapped to exit codes 0/1/2; no network I/O, no persistent state.
+`sentinel scan` is the sole MVP command: a fixed pipeline (discovery → engines → normalize → render), mapped to exit codes 0/1/2. Unless `--offline`, it MAY call `api.osv.dev` and write the XDG OSV advisory cache; it MUST NOT modify the repository or emit telemetry.
 
 ## Requirements
 
 ### Requirement: Command surface
 
-The CLI MUST expose exactly one command, `sentinel scan`, with options `--ci`, `--output <terminal|json|sarif>` (default `terminal`), and `--report <path>`; all other options, flags, or stubs MUST fail as usage errors (stderr diagnostics, empty stdout).
+The CLI MUST expose exactly one command, `sentinel scan`, with options `--ci`, `--offline`, `--output <terminal|json|sarif>` (default `terminal`), and `--report <path>`; all other options MUST fail as usage errors (stderr, empty stdout). `--offline` MUST be orthogonal to `--ci`.
 
 #### Scenario: Minimal invocation
 
 - GIVEN a git repo at the working directory
 - WHEN `sentinel scan` runs
-- THEN pipeline runs; exit 0 (no findings) or 1 (findings)
+- THEN pipeline runs; exit 0 or 1
 
-#### Scenario: CI flag accepted
+#### Scenario: Accepted flags
 
-- GIVEN a git repo at the working directory
-- WHEN `sentinel scan --ci` runs
-- THEN the pipeline runs with hermetic ignores; exit 0 (no findings) or 1 (findings)
-
-#### Scenario: Output and report flags accepted
-
-- GIVEN `--output json` or `--output sarif`, optionally with `--report <path>`
+- GIVEN `--ci`, `--offline`, `--ci --offline`, or `--output json|sarif` with optional `--report`
 - WHEN `sentinel scan` runs
-- THEN the chosen report is emitted; exit codes 0/1 unchanged
+- THEN the flag is honored (`--ci` hermetic; `--offline` zero HTTP); exit 0 or 1
 
-#### Scenario: Unsupported argument rejected
+#### Scenario: Usage errors
 
-- GIVEN `--explain` or a positional argument appended to `sentinel scan`
+- GIVEN `--explain`, a positional, `--output yaml`, or no subcommand
 - WHEN it runs
-- THEN usage error on stderr, empty stdout, exit code 2
-
-#### Scenario: Invalid output value rejected
-
-- GIVEN `--output yaml`
-- WHEN it runs
-- THEN usage error on stderr, empty stdout, exit code 2
-
-#### Scenario: Missing subcommand
-
-- GIVEN `sentinel` with no subcommand
-- WHEN it runs
-- THEN usage on stderr, exit code 2
+- THEN usage on stderr, empty stdout, exit 2
 
 ### Requirement: Exit-code contract
 
-`sentinel scan` MUST exit 0 (no findings), 1 (findings), or 2 (operational failure); empty repos exit 0; no others.
+`sentinel scan` MUST exit 0 (no findings), 1 (findings from any engine), or 2 (operational failure); empty repos exit 0. Network or cache degradation MUST NOT exit 2.
 
-#### Scenario: Clean repository exits 0
+#### Scenario: Clean or empty exits 0
 
-- GIVEN a git repo whose tracked files contain no secrets
+- GIVEN a clean repo or an empty initialized repo
 - WHEN `sentinel scan` runs
-- THEN no findings, exit code 0
+- THEN no findings, exit 0
 
 #### Scenario: Findings exit 1
 
-- GIVEN a repo whose tracked files contain a synthetic-secret fixture
+- GIVEN a synthetic-secret fixture
 - WHEN `sentinel scan` runs
-- THEN redacted findings, exit code 1
+- THEN redacted findings, exit 1
 
-#### Scenario: Empty repository exits 0
+#### Scenario: Dependency degrade does not exit 2
 
-- GIVEN an initialized git repository with no commits
+- GIVEN OSV unreachable after retries and no cache
 - WHEN `sentinel scan` runs
-- THEN zero findings and exit code 0
+- THEN warn, skip dependency findings, secrets still report, exit 0 or 1
 
-### Requirement: No network, no persistence, no telemetry
+### Requirement: Network, cache, and telemetry policy
 
-A scan MUST perform no network I/O, MUST NOT write, modify, or create files, MUST NOT read or write caches or persistent state, and MUST NOT collect or transmit telemetry; reads are limited to tracked files and `git` output, all other state in memory.
+Unless `--offline`, a scan MAY call only `api.osv.dev` `/v1/querybatch` and `/v1/vulns/{id}` and MAY write only the XDG advisory cache; it MUST NOT modify the repo or emit telemetry. With `--offline`, a scan MUST do zero HTTP and MUST NOT write the cache; reads are tracked files, `git` output, and the cache.
 
 #### Scenario: Hermetic offline execution
 
 - GIVEN a network-disabled environment and a read-only home
-- WHEN `sentinel scan` runs on a repo with findings
-- THEN output and exit code match a normal run
+- WHEN `sentinel scan --offline` runs on a repo with findings
+- THEN output and exit match a normal offline run
 
-#### Scenario: Read boundary leaves filesystem untouched
+#### Scenario: Online I/O bounds
 
-- GIVEN a repo with findings and a pre-run snapshot of paths and mtimes
-- WHEN `sentinel scan` runs
-- THEN findings reported, snapshot identical, no file written, modified, or created
+- GIVEN a findings repo with a path/mtime snapshot and an endpoint stub
+- WHEN `sentinel scan` runs online
+- THEN only OSV batch/detail are contacted; repo snapshot is unchanged; only the XDG cache is written
 
 ### Requirement: Delivery acceptance and CI quality gates
 
