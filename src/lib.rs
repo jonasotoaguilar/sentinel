@@ -54,7 +54,12 @@ fn run_inner(
             return ExitCode::from(errors::EXIT_OPERATIONAL);
         }
     };
-    let Command::Scan { ci, output, report } = cli.command;
+    let Command::Scan {
+        ci,
+        offline,
+        output,
+        report,
+    } = cli.command;
     let mode = if ci {
         discovery::Mode::Ci
     } else {
@@ -97,6 +102,23 @@ fn run_inner(
             Err(diagnostic) => diagnostics.push(diagnostic),
         }
     }
+
+    // Dependency review: after secrets, merge with dedupe_and_sort. OSV/cache
+    // failures degrade to diagnostics (0/1), never Exit 2.
+    let dep_cache = cache::XdgCache::new();
+    let dep_engine = if offline {
+        crate::engine::dependency::DependencyEngine::offline(dep_cache)
+    } else {
+        let osv: Box<dyn crate::osv::client::OsvApi> =
+            match crate::osv::client::UreqOsvClient::maybe_new(false) {
+                Some(c) => Box::new(c),
+                None => Box::new(crate::osv::client::StubOsv::new(vec![])),
+            };
+        crate::engine::dependency::DependencyEngine::online(dep_cache, osv)
+    };
+    let (dep_findings, dep_diags) = dep_engine.review(&root, &files);
+    diagnostics.extend(dep_diags);
+    findings.extend(dep_findings);
     let findings = normalize::dedupe_and_sort(findings);
 
     let _ = stderr.write_all(&render::render_diagnostics(&diagnostics));
@@ -320,6 +342,25 @@ mod tests {
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(out.is_empty());
         assert!(err.is_empty());
+    }
+
+    #[test]
+    fn offline_is_hermetic() {
+        let (_dir, root) = temp_repo();
+        let (c, o, e) = run_scan(&["scan", "--offline"], &root);
+        assert_eq!(c, ExitCode::SUCCESS);
+        assert!(o.is_empty() && e.is_empty());
+        let (c, o, e) = run_scan(&["scan", "--ci", "--offline"], &root);
+        assert_eq!(c, ExitCode::SUCCESS);
+        assert!(o.is_empty() && e.is_empty());
+        let (_dir, root) = secret_repo();
+        let (c, o, _) = run_scan(&["scan", "--offline"], &root);
+        assert_eq!(c, ExitCode::from(1));
+        assert!(
+            String::from_utf8(o)
+                .unwrap()
+                .contains("SECRET-synthetic-token")
+        );
     }
 
     #[test]
