@@ -53,6 +53,16 @@ impl DependencyEngine {
                     });
                     if let Some(b) = hit {
                         handle_cached(&b, pin, &mut diags, &mut out);
+                    } else if cache.as_ref().is_some_and(|c| {
+                        c.entry_present(pin.ecosystem.as_str(), &pin.name, &pin.version)
+                    }) {
+                        diags.push(Diagnostic::cache_entry_corrupt(
+                            &pin.path,
+                            &format!(
+                                "offline cache entry unreadable for {}@{}",
+                                pin.name, pin.version
+                            ),
+                        ));
                     } else {
                         diags.push(Diagnostic::osv_unavailable(
                             &pin.path,
@@ -406,5 +416,48 @@ mod tests {
         assert!(warm.iter().any(|f| f.rule_id == "OSV-GHSA-A1"));
         assert!(warm.iter().any(|f| f.rule_id == "OSV-GHSA-A2"));
         assert_eq!(warm, cold);
+    }
+    #[test]
+    fn offline_corrupt_entry_reports_corruption_not_a_miss() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = XdgCache::with_root(cache_dir.path().to_path_buf());
+        let key = cache.entry_path("npm", "lodash", "4.17.20").unwrap();
+        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+        std::fs::write(&key, b"{ not json").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("package-lock.json"),
+            r#"{"packages":{"node_modules/lodash":{"version":"4.17.20"}}}"#,
+        )
+        .unwrap();
+        let (findings, diags) = DependencyEngine::offline(Some(cache.clone()))
+            .review(root.path(), &[PathBuf::from("package-lock.json")]);
+        assert!(diags.iter().any(|d| d.code == "cache-entry-corrupt"));
+        assert!(!diags.iter().any(|d| d.code == "osv-unavailable"));
+        assert!(findings.is_empty());
+        assert_eq!(std::fs::read(&key).unwrap(), b"{ not json");
+        let big = vec![b'a'; 1024 * 1024 + 1];
+        std::fs::write(&key, &big).unwrap();
+        let (findings, diags) = DependencyEngine::offline(Some(cache))
+            .review(root.path(), &[PathBuf::from("package-lock.json")]);
+        assert!(diags.iter().any(|d| d.code == "cache-entry-corrupt"));
+        assert!(!diags.iter().any(|d| d.code == "osv-unavailable"));
+        assert!(findings.is_empty());
+        assert_eq!(std::fs::read(&key).unwrap(), big);
+    }
+    #[test]
+    fn offline_absent_entry_is_still_a_miss() {
+        let cache = XdgCache::with_root(tempfile::tempdir().unwrap().path().to_path_buf());
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("package-lock.json"),
+            r#"{"packages":{"node_modules/lodash":{"version":"4.17.20"}}}"#,
+        )
+        .unwrap();
+        let (findings, diags) = DependencyEngine::offline(Some(cache))
+            .review(root.path(), &[PathBuf::from("package-lock.json")]);
+        assert!(findings.is_empty());
+        assert!(diags.iter().any(|d| d.code == "osv-unavailable"));
+        assert!(!diags.iter().any(|d| d.code == "cache-entry-corrupt"));
     }
 }
