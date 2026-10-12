@@ -70,7 +70,12 @@ pub struct Diagnostic {
     /// Deterministic detail.
     pub message: String,
 }
-
+pub(crate) fn sanitize(m: &str) -> String {
+    m.chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .take(200)
+        .collect()
+}
 impl Diagnostic {
     /// A tracked file could not be read; the file is skipped.
     pub fn read_failed(path: &str, error: &std::io::Error) -> Self {
@@ -89,6 +94,54 @@ impl Diagnostic {
             path: String::new(),
             rule: rule.to_string(),
             message,
+        }
+    }
+    pub fn version_unpinned_skipped(path: &str, line: u64) -> Self {
+        Self {
+            code: "version-unpinned-skipped",
+            path: path.to_string(),
+            rule: String::new(),
+            message: format!("unpinned at {path}:{line}"),
+        }
+    }
+    pub fn manifest_parse_failed(path: &str, msg: &str) -> Self {
+        Self {
+            code: "manifest-parse-failed",
+            path: path.to_string(),
+            rule: String::new(),
+            message: sanitize(msg),
+        }
+    }
+    pub fn osv_degraded(msg: &str) -> Self {
+        Self {
+            code: "osv-degraded",
+            path: String::new(),
+            rule: String::new(),
+            message: sanitize(msg),
+        }
+    }
+    pub fn osv_unavailable(path: &str, msg: &str) -> Self {
+        Self {
+            code: "osv-unavailable",
+            path: path.to_string(),
+            rule: String::new(),
+            message: sanitize(msg),
+        }
+    }
+    pub fn cache_entry_corrupt(path: &str, msg: &str) -> Self {
+        Self {
+            code: "cache-entry-corrupt",
+            path: path.to_string(),
+            rule: String::new(),
+            message: sanitize(msg),
+        }
+    }
+    pub fn advisory_invalid(msg: &str) -> Self {
+        Self {
+            code: "advisory-invalid",
+            path: String::new(),
+            rule: String::new(),
+            message: sanitize(msg),
         }
     }
 }
