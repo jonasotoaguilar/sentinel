@@ -1,0 +1,6 @@
+{
+  "_note": "SYNTHETIC FIXTURE - synthetic OSV advisory seed for offline dependency E2E.",
+  "id": "GHSA-SYNTHETIC-0001",
+  "summary": "Synthetic test advisory for dependency E2E",
+  "severity": [{ "type": "CVSS_V3", "score": "9.8" }]
+}

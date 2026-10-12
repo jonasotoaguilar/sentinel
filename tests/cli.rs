@@ -625,3 +625,25 @@ fn fixture_corpus_is_synthetic_only() {
         "fixture corpus is unexpectedly small ({audited} files)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// cli-scan: --offline acceptance and --ci orthogonality (dependency-review
+// S1/S3; the seeded-cache matrix lives in tests/dependency.rs)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn offline_flag_is_accepted_and_matches_ci_offline() {
+    let (_dir, root) = golden_repo();
+    let plain = scan_bin(&root).arg("--offline").output().unwrap();
+    let ci = scan_bin(&root)
+        .args(["--ci", "--offline"])
+        .output()
+        .unwrap();
+    assert_eq!(plain.status.code(), Some(1), "--offline is accepted");
+    assert_eq!(ci.status.code(), Some(1));
+    assert_eq!(
+        plain.stdout, ci.stdout,
+        "--ci must not change --offline terminal output"
+    );
+    assert_eq!(plain.stderr, ci.stderr);
+}
