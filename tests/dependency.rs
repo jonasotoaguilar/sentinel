@@ -9,13 +9,16 @@ use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::UNIX_EPOCH;
 use tempfile::TempDir;
+
+mod common;
+use common::{AWS_KEY, TOKEN, git, temp_repo, text_of};
 
 fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -26,31 +29,6 @@ fn fixture_root() -> PathBuf {
 fn fixture_bytes(rel: &str) -> Vec<u8> {
     std::fs::read(fixture_root().join(rel))
         .unwrap_or_else(|error| panic!("cannot read fixture {rel}: {error}"))
-}
-
-fn git<I, S>(cwd: &Path, args: I)
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("HOME", cwd)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success(), "git failed in {cwd:?}");
-}
-
-fn temp_repo() -> (TempDir, PathBuf) {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_path_buf();
-    git(&root, ["init", "-q"]);
-    (dir, root)
 }
 
 fn track_fixture(root: &Path, fixture_rel: &str, repo_rel: &str) {
@@ -77,10 +55,6 @@ fn scan_with(xdg: &Path, root: &Path, args: &[&str]) -> Output {
         .args(args)
         .output()
         .unwrap()
-}
-
-fn text_of(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
 }
 
 fn snapshot_tree(root: &Path) -> Vec<(PathBuf, u64, u128)> {
@@ -352,10 +326,9 @@ fn seeded_reports_are_byte_identical_across_runs() {
 #[test]
 fn advisory_id_and_summary_are_redacted_on_every_surface() {
     // Why: the advisory id and summary are content-derived display fields.
-    const RAW_ID: &str = "AKIASYNTHETICKEY1234";
-    const RAW_SECRET: &str = "sk-synthetic-1234567890";
+    // The seeded values are the shared declared synthetics.
     assert!(
-        sentinel::osv::is_valid_id(RAW_ID),
+        sentinel::osv::is_valid_id(AWS_KEY),
         "seeded id must pass validation"
     );
     let (_dir, root) = temp_repo();
@@ -370,8 +343,8 @@ fn advisory_id_and_summary_are_redacted_on_every_surface() {
     );
     let xdg = TempDir::new().unwrap();
     let advisory = serde_json::json!([{
-        "id": RAW_ID,
-        "summary": format!("exposes {RAW_SECRET} in summary"),
+        "id": AWS_KEY,
+        "summary": format!("exposes {TOKEN} in summary"),
         "severity": [{"type": "CVSS_V3", "score": "9.8"}]
     }]);
     seed_cache(
@@ -389,11 +362,11 @@ fn advisory_id_and_summary_are_redacted_on_every_surface() {
         "finding present: {terminal_blob}"
     );
     assert!(
-        !terminal_blob.contains(RAW_ID),
+        !terminal_blob.contains(AWS_KEY),
         "raw advisory id leaked on terminal: {terminal_blob}"
     );
     assert!(
-        !terminal_blob.contains(RAW_SECRET),
+        !terminal_blob.contains(TOKEN),
         "raw summary secret leaked on terminal: {terminal_blob}"
     );
     assert!(
@@ -405,11 +378,11 @@ fn advisory_id_and_summary_are_redacted_on_every_surface() {
     let json_blob = text_of(&json.stdout) + &text_of(&json.stderr);
     assert!(json_blob.contains("OSV-"), "finding present: {json_blob}");
     assert!(
-        !json_blob.contains(RAW_ID),
+        !json_blob.contains(AWS_KEY),
         "raw advisory id leaked in json: {json_blob}"
     );
     assert!(
-        !json_blob.contains(RAW_SECRET),
+        !json_blob.contains(TOKEN),
         "raw summary secret leaked in json: {json_blob}"
     );
     let sarif = scan_with(xdg.path(), &root, &["--offline", "--output", "sarif"]);
@@ -417,11 +390,11 @@ fn advisory_id_and_summary_are_redacted_on_every_surface() {
     let sarif_blob = text_of(&sarif.stdout) + &text_of(&sarif.stderr);
     assert!(sarif_blob.contains("OSV-"), "finding present: {sarif_blob}");
     assert!(
-        !sarif_blob.contains(RAW_ID),
+        !sarif_blob.contains(AWS_KEY),
         "raw advisory id leaked in sarif: {sarif_blob}"
     );
     assert!(
-        !sarif_blob.contains(RAW_SECRET),
+        !sarif_blob.contains(TOKEN),
         "raw summary secret leaked in sarif: {sarif_blob}"
     );
     serde_json::from_slice::<serde_json::Value>(&sarif.stdout).unwrap();
@@ -438,11 +411,11 @@ fn advisory_id_and_summary_are_redacted_on_every_surface() {
         "finding present: {report_blob}"
     );
     assert!(
-        !report_blob.contains(RAW_ID),
+        !report_blob.contains(AWS_KEY),
         "raw advisory id leaked in report file: {report_blob}"
     );
     assert!(
-        !report_blob.contains(RAW_SECRET),
+        !report_blob.contains(TOKEN),
         "raw summary secret leaked in report file: {report_blob}"
     );
 }

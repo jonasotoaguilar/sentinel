@@ -5,15 +5,14 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::ExitCode;
 
 use tempfile::TempDir;
 
 use sentinel::run as scan_seam;
 
-/// The two named synthetic values the fixture corpus may contain.
-const AWS_KEY: &str = "AKIASYNTHETICKEY1234";
-const TOKEN: &str = "sk-synthetic-1234567890";
+mod common;
+use common::{AWS_KEY, TOKEN, git, temp_repo, text_of};
 
 fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -24,31 +23,6 @@ fn fixture_root() -> PathBuf {
 fn fixture_bytes(rel: &str) -> Vec<u8> {
     std::fs::read(fixture_root().join(rel))
         .unwrap_or_else(|error| panic!("cannot read fixture {rel}: {error}"))
-}
-
-fn git<I, S>(cwd: &Path, args: I)
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("HOME", cwd)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success(), "git failed in {cwd:?}");
-}
-
-fn temp_repo() -> (TempDir, PathBuf) {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_path_buf();
-    git(&root, ["init", "-q"]);
-    (dir, root)
 }
 
 fn write_tracked(root: &Path, name: &OsStr, contents: &[u8]) {
@@ -78,10 +52,6 @@ fn scan(args: &[&str], cwd: &Path) -> (ExitCode, Vec<u8>, Vec<u8>) {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let (mut out, mut err) = (Vec::new(), Vec::new());
     (scan_seam(&args, cwd, &mut out, &mut err), out, err)
-}
-
-fn text_of(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// The pinned official SARIF 2.1.0 schema (Draft 7, self-contained fixture).

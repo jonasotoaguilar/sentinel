@@ -234,13 +234,16 @@ mod tests {
         }
     }
     #[test]
-    fn all() {
+    fn pinned_requirement_parses_while_range_and_bare_name_do_not() {
         let (p, _ds) = parse_file(
             "requirements.txt",
             b"requests>=2.0\nflask==2.3.3\ninvalid\n",
         );
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].name, "flask");
+    }
+    #[test]
+    fn hostile_requirement_names_emit_no_raw_text() {
         let b = format!(
             "{}==1.0\n{}==1.0\n(pkg==nan\n",
             "<script>alert(1)</script>", "../etc/passwd"
@@ -249,24 +252,42 @@ mod tests {
         let (p, ds) = parse_file("requirements.txt", &b);
         assert!(p.is_empty());
         no_leak(&ds, "<script>");
+    }
+    #[test]
+    fn extras_syntax_counts_as_unpinned() {
         let (p, ds) = parse_file(
             "a/requirements.txt",
             b"flask==2.3.3\nrequests[security]==2.28.0\n",
         );
         assert_eq!(p.len(), 1);
         assert_eq!(ds.len(), 1);
+    }
+    #[test]
+    fn oversize_manifest_refused_before_parsing() {
         let big = vec![b'a'; MAX_SCAN_FILE_BYTES as usize];
         let (_p, ds) = parse_file("requirements.txt", &big);
         assert_eq!(ds[0].code, "skipped-large");
+    }
+    #[test]
+    fn unknown_manifest_shape_is_ignored() {
         let (p, ds) = parse_file("pyproject.toml", b"[tool]");
         assert!(p.is_empty() && ds.is_empty());
+    }
+    #[test]
+    fn malformed_lock_reports_parse_failure() {
         let (p, ds) = parse_file("package-lock.json", b"{ invalid");
         assert!(p.is_empty());
         assert_eq!(ds[0].code, "manifest-parse-failed");
+    }
+    #[test]
+    fn hostile_npm_names_emit_no_raw_text() {
         let j = r#"{"packages":{"node_modules/<script>":{"version":"1.0.0"},"node_modules/../escape":{"version":"1.0.0"}}}"#;
         let (p, ds) = parse_file("package-lock.json", j.as_bytes());
         assert!(p.is_empty());
         no_leak(&ds, "<script>");
+    }
+    #[test]
+    fn legacy_dependencies_map_and_empty_root_package_parse() {
         let (p, _) = parse_file(
             "package-lock.json",
             r#"{"dependencies":{"lodash":{"version":"4.17.20"}}}"#.as_bytes(),

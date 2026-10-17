@@ -274,8 +274,7 @@ mod tests {
     use crate::cache::XdgCache;
     use std::path::PathBuf;
     #[test]
-    fn all() {
-        let b = crate::osv::client::constructions();
+    fn offline_review_of_nothing_emits_nothing() {
         assert!(
             DependencyEngine::offline(Some(XdgCache::with_root(
                 tempfile::tempdir().unwrap().path().to_path_buf()
@@ -284,8 +283,15 @@ mod tests {
             .0
             .is_empty()
         );
+    }
+    #[test]
+    fn offline_engine_constructs_no_client() {
+        let b = crate::osv::client::constructions();
         assert!(crate::osv::client::UreqOsvClient::maybe_new(true).is_none());
         assert_eq!(crate::osv::client::constructions(), b);
+    }
+    #[test]
+    fn seeded_cache_hit_resolves_pinned_rule_id() {
         let c2 = XdgCache::with_root(tempfile::tempdir().unwrap().path().to_path_buf());
         c2.put("npm", "lodash", "4.17.20", &serde_json::to_vec(&serde_json::json!({"id":"GHSA-1234","summary":"t","severity":[{"type":"CVSS_V3","score":"9.8"}]})).unwrap()).unwrap();
         let r = tempfile::tempdir().unwrap();
@@ -301,6 +307,9 @@ mod tests {
                 .rule_id,
             "OSV-GHSA-1234"
         );
+    }
+    #[test]
+    fn offline_cache_miss_reports_unavailable() {
         let r3 = tempfile::tempdir().unwrap();
         std::fs::write(
             r3.path().join("requirements.txt"),
@@ -317,6 +326,9 @@ mod tests {
             .iter()
             .any(|d| d.code == "osv-unavailable")
         );
+    }
+    #[test]
+    fn online_failure_reports_unavailable() {
         let r4 = tempfile::tempdir().unwrap();
         std::fs::write(r4.path().join("requirements.txt"), b"flask==2.3.3\n").unwrap();
         let (_, diags) = DependencyEngine::online(

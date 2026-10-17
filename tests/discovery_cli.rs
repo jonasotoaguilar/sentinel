@@ -18,9 +18,9 @@ use std::time::UNIX_EPOCH;
 use assert_cmd::Command as AssertCommand;
 use tempfile::TempDir;
 
-/// The two named synthetic values the fixture corpus may contain (task 4.1).
-const AWS_KEY: &str = "AKIASYNTHETICKEY1234";
-const TOKEN: &str = "sk-synthetic-1234567890";
+mod common;
+use common::{AWS_KEY, TOKEN, git, temp_repo, text_of};
+
 const TEN_MIB: u64 = 10 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -37,34 +37,6 @@ fn fixture_root() -> PathBuf {
 fn fixture_bytes(rel: &str) -> Vec<u8> {
     std::fs::read(fixture_root().join(rel))
         .unwrap_or_else(|error| panic!("cannot read fixture {rel}: {error}"))
-}
-
-/// Runs git inside `cwd` with a hermetic config environment (no system/global
-/// config, no user home), mirroring the unit-test helper.
-fn git<I, S>(cwd: &Path, args: I)
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("HOME", cwd)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success(), "git failed in {cwd:?}");
-}
-
-/// Creates an empty temp git repository (initialized, no commits).
-fn temp_repo() -> (TempDir, PathBuf) {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_path_buf();
-    git(&root, ["init", "-q"]);
-    (dir, root)
 }
 
 /// Writes bytes into the repository and stages them as a tracked file.
@@ -141,10 +113,6 @@ fn spawn_scan(cwd: &Path) -> std::process::Child {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap()
-}
-
-fn text_of(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// A repository with tracked and untracked findings plus a 10 MiB untracked
