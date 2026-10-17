@@ -10,10 +10,6 @@ src = "docs"
 [build]
 build-dir = "book"
 create-missing = false
-# The design records are for someone changing the code; this book is for
-# someone using it. `exclude` keeps them out of the rendered site instead of
-# relying on them merely being absent from SUMMARY.
-exclude = ["adr/**"]
 
 [output.html]
 git-repository-url = "https://github.com/jonasotoaguilar/sentinel"
