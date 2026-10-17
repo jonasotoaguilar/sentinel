@@ -135,7 +135,11 @@ fn json_golden_matches_reviewable_snapshot() {
     let (_dir, root) = golden_repo();
     let (code, stdout, _) = scan(&["scan", "--output", "json"], &root);
     assert_eq!(code, ExitCode::from(1));
-    insta::assert_snapshot!("json_golden_corpus", text_of(&stdout));
+    // The snapshot covers the findings, not the crate version. Normalizing the
+    // version keeps a release bump from rewriting a golden corpus that did not
+    // change; the version itself is asserted in tests/cli.rs.
+    let text = text_of(&stdout).replace(env!("CARGO_PKG_VERSION"), "<version>");
+    insta::assert_snapshot!("json_golden_corpus", text);
 }
 
 #[test]
