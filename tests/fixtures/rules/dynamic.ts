@@ -1,0 +1,2 @@
+// SYNTHETIC FIXTURE
+eval(userInput);
