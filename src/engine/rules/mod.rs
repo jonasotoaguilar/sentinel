@@ -1,7 +1,5 @@
-//! Code-rules engine skeleton (PR1): language-aware Tree-sitter matching
-//! for the pinned rule set, emitting the shared redacted [`Candidate`].
-//! Only `RULE-weak-hash` is implemented in this unit; the remaining rules
-//! arrive as further entries in the rule table.
+//! Code-rules engine (PR1 skeleton plus the JavaScript/TypeScript rule set);
+//! Python rules arrive as further entries in the rule table.
 
 pub mod javascript;
 pub mod lang;
@@ -37,8 +35,12 @@ pub(crate) struct RuleDef {
     matches: Matcher,
 }
 
-/// The production table; PR2/PR3 extend this list without other changes.
-const RULE_DEFS: &[RuleDef] = &[javascript::WEAK_HASH_DEF];
+/// The production table; PR3 extends this list without other changes.
+const RULE_DEFS: &[RuleDef] = &[
+    javascript::WEAK_HASH_DEF,
+    javascript::DYNAMIC_CODE_DEF,
+    javascript::SHELL_INJECTION_DEF,
+];
 
 /// The code-rules engine over a compiled rule table.
 pub struct RulesEngine {
