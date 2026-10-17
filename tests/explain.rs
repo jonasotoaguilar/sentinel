@@ -23,8 +23,11 @@ use tempfile::TempDir;
 const AWS_KEY: &str = "AKIASYNTHETICKEY1234";
 const TOKEN: &str = "sk-synthetic-1234567890";
 
-/// Recorded traffic of one stub endpoint: its URL, request bodies, and the
-/// accepted-connection count (the single-attempt evidence).
+/// Recorded traffic of one stub endpoint: its URL, explain-request bodies,
+/// and the explain-request count (the single-attempt evidence). Only
+/// `POST /explain` connections record: anything else on loopback (port
+/// probers send `GET /`) is refused without recording, so the count pins
+/// this test's scans rather than ambient traffic.
 type Recorded = (String, Arc<Mutex<Vec<Vec<u8>>>>, Arc<AtomicUsize>);
 
 /// What the stub endpoint answers every request with.
@@ -51,8 +54,15 @@ fn stub_server(mode: Respond) -> Recorded {
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
+            let (method, path, body) = read_request(&mut stream);
+            if method != "POST" || path != "/explain" {
+                refuse(&mut stream);
+                continue;
+            }
+            // Recording precedes the reply, and the child waits for the
+            // reply before exiting, so once `output()` returns every
+            // legitimate request is already counted: no sleep needed.
             kept_count.fetch_add(1, Ordering::SeqCst);
-            let body = read_body(&mut stream);
             kept_bodies.lock().unwrap().push(body.clone());
             if matches!(mode, Respond::Stall) {
                 std::thread::sleep(Duration::from_secs(30));
@@ -74,15 +84,19 @@ fn stub_server(mode: Respond) -> Recorded {
     (url, bodies, count)
 }
 
-/// Reads one HTTP/1.1 request head plus its `Content-Length` body.
-fn read_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
+/// Reads one HTTP/1.1 request: its method, path, and `Content-Length` body.
+fn read_request(stream: &mut std::net::TcpStream) -> (String, String, Vec<u8>) {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
         let Ok(1) = stream.read(&mut byte) else { break };
         head.push(byte[0]);
     }
-    let length = String::from_utf8_lossy(&head)
+    let text = String::from_utf8_lossy(&head).into_owned();
+    let mut first = text.lines().next().unwrap_or("").split_whitespace();
+    let method = first.next().unwrap_or("").to_string();
+    let path = first.next().unwrap_or("").to_string();
+    let length = text
         .lines()
         .find_map(|line| {
             line.to_ascii_lowercase()
@@ -93,7 +107,14 @@ fn read_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
         .unwrap_or(0);
     let mut body = vec![0u8; length.min(1 << 20)];
     let _ = stream.read_exact(&mut body);
-    body
+    (method, path, body)
+}
+
+/// Refuses a connection that is not an explain request without recording
+/// it, so ambient loopback traffic never moves a test's count.
+fn refuse(stream: &mut std::net::TcpStream) {
+    let _ = stream
+        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 }
 
 /// Builds one advisory entry per requested finding id.
@@ -273,7 +294,6 @@ fn http_500_degrades_to_explain_failed_after_a_single_attempt() {
     let (_dir, root) = secret_repo();
     let (url, _bodies, count) = stub_server(Respond::Fixed(500, "{}"));
     let output = scan_explained(&root, &url, &["--explain"]);
-    std::thread::sleep(std::time::Duration::from_millis(100));
     assert_eq!(
         count.load(Ordering::SeqCst),
         1,
@@ -326,7 +346,10 @@ fn stalled_endpoint_is_bounded_by_the_ten_second_timeout() {
         "the full timeout runs: {elapsed:?}"
     );
     assert!(
-        elapsed < Duration::from_secs(25),
+        elapsed < Duration::from_secs(30),
+        // The stub itself gives up at 30 s, so returning before then proves
+        // the client enforced its own 10 s timeout; the headroom absorbs a
+        // loaded runner without going tight against the timeout.
         "the stall is bounded: {elapsed:?}"
     );
     assert_eq!(output.status.code(), Some(1), "exit code is untouched");
@@ -364,7 +387,6 @@ fn no_http_without_flag_or_under_ci_or_offline() {
         assert_eq!(output.stdout, expected.stdout, "args {args:?}");
         assert_eq!(output.stderr, expected.stderr, "args {args:?}");
     }
-    std::thread::sleep(std::time::Duration::from_millis(100));
     assert_eq!(
         count.load(Ordering::SeqCst),
         0,
@@ -440,7 +462,6 @@ fn userinfo_endpoint_is_refused_without_any_request() {
     // accepted URL would arrive as a request.
     let evil = format!("http://127.0.0.1:9@127.0.0.1:{port}/explain");
     let output = scan_explained(&root, &evil, &["--explain"]);
-    std::thread::sleep(std::time::Duration::from_millis(200));
     assert_eq!(
         count.load(Ordering::SeqCst),
         0,
@@ -472,7 +493,6 @@ fn proxy_environment_is_ignored() {
         ("no_proxy", "example.invalid"),
     ];
     let output = scan_explained_with_env(&root, &endpoint_url, &["--explain"], &proxy_env);
-    std::thread::sleep(std::time::Duration::from_millis(200));
     assert_eq!(
         endpoint_count.load(Ordering::SeqCst),
         1,
@@ -501,8 +521,12 @@ fn redirect_is_a_failure_without_a_second_request() {
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
+            let (method, path, _) = read_request(&mut stream);
+            if method != "POST" || path != "/explain" {
+                refuse(&mut stream);
+                continue;
+            }
             kept.fetch_add(1, Ordering::SeqCst);
-            let _ = read_body(&mut stream);
             let reply = format!(
                 "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             );
@@ -510,7 +534,6 @@ fn redirect_is_a_failure_without_a_second_request() {
         }
     });
     let output = scan_explained(&root, &redirect_url, &["--explain"]);
-    std::thread::sleep(std::time::Duration::from_millis(200));
     assert_eq!(
         redirect_count.load(Ordering::SeqCst),
         1,
