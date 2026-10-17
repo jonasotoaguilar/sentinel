@@ -3,6 +3,7 @@
 
 mod cache;
 mod cli;
+mod config;
 mod discovery;
 mod engine;
 mod errors;
@@ -40,18 +41,50 @@ pub fn run(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> ExitCode {
-    run_inner(&SecretsEngine::new(), args, cwd, stdout, stderr)
+    // Production routing: the user-level config comes from the live process
+    // environment (`SENTINEL_CONFIG`, else the XDG lookup). Tests bypass
+    // `run` for `run_inner` with an explicit choice, so no in-process test
+    // depends on the developer's home directory.
+    run_inner(
+        &SecretsEngine::new(),
+        args,
+        cwd,
+        stdout,
+        stderr,
+        config::user_path(),
+    )
+}
+
+/// Runs the requested command with the user level of the configuration
+/// skipped entirely.
+///
+/// The production entry point reads the user level from the live process
+/// environment, which an in-process test cannot control without racing other
+/// tests over `HOME`. Tests that scan in-process use this instead, so that a
+/// developer's own `~/.config/sentinel/config.toml` cannot change what a test
+/// scans. Project-level configuration is still read, because it belongs to
+/// the repository under test.
+pub fn run_without_user_config(
+    args: &[String],
+    cwd: &Path,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ExitCode {
+    run_inner(&SecretsEngine::new(), args, cwd, stdout, stderr, None)
 }
 
 /// The pipeline over an explicit engine; tests inject engines containing a
 /// failing rule. Reads and detection run in parallel and are
 /// collected in file order; normalization sorts by (fingerprint, path, line).
+/// `user_config` is the explicit user-level routing: `Some(path)` reads that
+/// file, `None` skips the user level entirely (hermetic tests).
 fn run_inner(
     engine: &SecretsEngine,
     args: &[String],
     cwd: &Path,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
+    user_config: Option<PathBuf>,
 ) -> ExitCode {
     // The HTTP adapter is built once per scan from the environment;
     // without both variables the disabled explainer keeps the skip path.
@@ -61,7 +94,7 @@ fn run_inner(
         Some(adapter) => adapter,
         None => &disabled,
     };
-    run_with_deps(engine, explainer, args, cwd, stdout, stderr)
+    run_with_deps(engine, explainer, args, cwd, stdout, stderr, user_config)
 }
 
 /// Enforces the file budget on discovery output: the leading files up to
@@ -141,6 +174,8 @@ fn is_offline_scan(args: &[String]) -> bool {
 /// both): builds exactly the dependency client an online scan uses — and no
 /// client at all for `--offline` — then delegates to [`run_with_dep_client`],
 /// so policy and exit codes cannot drift between the two paths.
+/// `user_config` is the explicit user-level routing: `Some(path)` reads that
+/// file, `None` skips the user level entirely (hermetic tests).
 pub fn run_with_deps(
     engine: &SecretsEngine,
     explainer: &dyn Explainer,
@@ -148,6 +183,7 @@ pub fn run_with_deps(
     cwd: &Path,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
+    user_config: Option<PathBuf>,
 ) -> ExitCode {
     // `None` means offline: the offline branch constructs zero OSV clients,
     // and the online path receives exactly the client built today.
@@ -159,13 +195,34 @@ pub fn run_with_deps(
             None => Box::new(crate::osv::client::StubOsv::new(vec![])),
         })
     };
-    run_with_dep_client(engine, explainer, osv, args, cwd, stdout, stderr)
+    run_with_dep_client(
+        engine,
+        explainer,
+        ScanDeps { osv, user_config },
+        args,
+        cwd,
+        stdout,
+        stderr,
+    )
 }
 
-/// The dependency-client seam: the online path's OSV client injected by the
-/// caller (`None` means offline), so the unreachable-endpoint contract is
-/// testable without a network dial. [`run_with_deps`] is the single caller;
-/// production behaviour is unchanged — same client, same policy, same exit codes.
+/// The per-scan dependencies the caller injects instead of the pipeline
+/// reading them itself: the online path's OSV client (`None` means offline)
+/// and the user-config routing (`None` skips the user level entirely).
+/// Tests stage unreachable endpoints and hostile configs through this struct,
+/// so no in-process test depends on the network or the developer's home
+/// directory.
+pub(crate) struct ScanDeps {
+    pub osv: Option<Box<dyn crate::osv::client::OsvApi>>,
+    pub user_config: Option<PathBuf>,
+}
+
+/// The dependency-client seam: the caller injects [`ScanDeps`] — the online
+/// path's OSV client (`None` means offline) and the user-config routing — so
+/// the unreachable-endpoint contract and the hostile-config contract are both
+/// testable without a network dial or touching the process environment.
+/// [`run_with_deps`] is the single production caller; production behaviour is
+/// unchanged — same client, same routing, same policy, same exit codes.
 ///
 /// The pipeline over an explicit engine and explainer (tests inject the stub,
 /// so no test touches the network). The explainer runs at most once per scan:
@@ -173,12 +230,13 @@ pub fn run_with_deps(
 pub(crate) fn run_with_dep_client(
     engine: &SecretsEngine,
     explainer: &dyn Explainer,
-    osv: Option<Box<dyn crate::osv::client::OsvApi>>,
+    deps: ScanDeps,
     args: &[String],
     cwd: &Path,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> ExitCode {
+    let ScanDeps { osv, user_config } = deps;
     let cli = match cli::parse(args) {
         Ok(cli) => cli,
         Err(usage) => {
@@ -215,6 +273,7 @@ pub(crate) fn run_with_dep_client(
         output,
         report,
         explain,
+        exclude,
     } = cli.command
     else {
         unreachable!("`Completions` returns above, so only `Scan` reaches here");
@@ -243,6 +302,14 @@ pub(crate) fn run_with_dep_client(
         files,
         diagnostics: discovery_diagnostics,
     } = discovered;
+    // Layered excludes (T1): CLI flags, then the project `sentinel.toml`,
+    // then the user-level file at the caller-chosen path — `None` skips it,
+    // which keeps hermetic tests immune to the developer's home directory.
+    // The same merged set applies in both modes, so `--ci` stays hermetic.
+    let (configured_excludes, config_diagnostics) =
+        config::resolve_with(&root, &exclude, user_config);
+    let (files, exclude_diagnostics) =
+        discovery::apply_excludes(&root, files, &configured_excludes);
     // Total budgets (S7): production values from one documented value.
     // Each breach degrades through diagnostics; exit codes stay 0/1 and
     // truncation is never silent.
@@ -254,6 +321,8 @@ pub(crate) fn run_with_dep_client(
     // merge before the deterministic renderer.
     let mut diagnostics = engine.init_diagnostics().to_vec();
     diagnostics.extend(discovery_diagnostics);
+    diagnostics.extend(config_diagnostics);
+    diagnostics.extend(exclude_diagnostics);
     diagnostics.extend(files_diag);
     // The code-rules engine runs per file after secrets; its rule
     // failures merge into the same diagnostics vector.
@@ -470,7 +539,7 @@ pub(crate) fn run_with_dep_client(
 
 #[cfg(test)]
 mod tests {
-    use super::{run, run_inner, run_with_deps};
+    use super::{ScanDeps, run_inner, run_with_deps};
     use crate::engine::secrets::{RuleSpec, SecretsEngine};
     use crate::finding::Severity;
     use crate::test_util::{temp_repo, write_tracked, write_untracked};
@@ -485,7 +554,10 @@ mod tests {
     fn run_scan(args: &[&str], cwd: &Path) -> (ExitCode, Vec<u8>, Vec<u8>) {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        (run(&args, cwd, &mut out, &mut err), out, err)
+        // Hermetic by construction: no user-level config, so the developer's
+        // home directory can never change what a scan sees.
+        let code = run_inner(&SecretsEngine::new(), &args, cwd, &mut out, &mut err, None);
+        (code, out, err)
     }
 
     fn secret_repo() -> (TempDir, PathBuf) {
@@ -561,7 +633,14 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run_inner(&broken_rule_engine(), &args, &root, &mut out, &mut err);
+        let code = run_inner(
+            &broken_rule_engine(),
+            &args,
+            &root,
+            &mut out,
+            &mut err,
+            None,
+        );
         assert_eq!(code, ExitCode::from(1));
         assert!(out.is_empty(), "stdout stays empty with --report");
         let err_text = String::from_utf8(err).unwrap();
@@ -579,7 +658,14 @@ mod tests {
         let (_dir, root) = secret_repo();
         let args = vec!["scan".to_string()];
         let mut err = Vec::new();
-        let code = run(&args, &root, &mut FailWriter, &mut err);
+        let code = run_inner(
+            &SecretsEngine::new(),
+            &args,
+            &root,
+            &mut FailWriter,
+            &mut err,
+            None,
+        );
         assert_eq!(code, ExitCode::from(2));
         assert!(
             String::from_utf8(err)
@@ -709,7 +795,15 @@ mod tests {
     ) -> (ExitCode, Vec<u8>, Vec<u8>) {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run_with_deps(&SecretsEngine::new(), stub, &args, cwd, &mut out, &mut err);
+        let code = run_with_deps(
+            &SecretsEngine::new(),
+            stub,
+            &args,
+            cwd,
+            &mut out,
+            &mut err,
+            None,
+        );
         (code, out, err)
     }
 
@@ -894,6 +988,7 @@ mod tests {
             &offline_root,
             &mut out,
             &mut err,
+            None,
         );
         assert_eq!(
             code,
@@ -923,7 +1018,10 @@ mod tests {
         let code = super::run_with_dep_client(
             &SecretsEngine::new(),
             &DisabledExplainer,
-            Some(Box::new(FailOsv)),
+            ScanDeps {
+                osv: Some(Box::new(FailOsv)),
+                user_config: None,
+            },
             &args,
             &root,
             &mut out,
@@ -1109,5 +1207,226 @@ mod tests {
             "omitted count must travel: {}",
             diagnostic.message
         );
+    }
+
+    /// Two secret-bearing files, one excluded by flag: only the kept file
+    /// reports, and the exit stays 1 because a finding remains.
+    #[test]
+    fn exclude_flag_removes_matching_file_from_scan() {
+        let (_dir, root) = temp_repo();
+        write_tracked(
+            &root,
+            OsStr::new("keep.env"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        write_tracked(
+            &root,
+            OsStr::new("skip.log"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        let (code, out, err) = run_scan(&["scan", "--exclude", "*.log"], &root);
+        assert_eq!(code, ExitCode::from(1));
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(out_text.contains("keep.env:1:"), "stdout: {out_text}");
+        assert!(!out_text.contains("skip.log"), "excluded: {out_text}");
+        assert!(
+            !String::from_utf8(err).unwrap().contains(SYNTHETIC_TOKEN),
+            "no raw secret on stderr"
+        );
+    }
+
+    /// The repo-local ignore file removes files through the full pipeline:
+    /// a tracked secret covered by `.sentinelignore` never reports.
+    #[test]
+    fn sentinelignore_removes_matching_file_through_scan() {
+        let (_dir, root) = temp_repo();
+        write_untracked(&root, OsStr::new(".sentinelignore"), b"*.secret\n");
+        write_tracked(
+            &root,
+            OsStr::new("tracked.secret"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        write_tracked(&root, OsStr::new("clean.txt"), b"no secrets here");
+        let (code, out, err) = run_scan(&["scan"], &root);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(out.is_empty());
+        assert!(err.is_empty());
+    }
+
+    /// The project config is the first consumer of the config file: an
+    /// `exclude` there removes the file with no CLI flag involved.
+    #[test]
+    fn project_config_exclude_removes_matching_file() {
+        let (_dir, root) = temp_repo();
+        write_untracked(
+            &root,
+            OsStr::new("sentinel.toml"),
+            b"exclude = [\"*.log\"]\n",
+        );
+        write_tracked(
+            &root,
+            OsStr::new("keep.env"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        write_tracked(
+            &root,
+            OsStr::new("skip.log"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        let (code, out, _) = run_scan(&["scan"], &root);
+        assert_eq!(code, ExitCode::from(1));
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(out_text.contains("keep.env:1:"), "stdout: {out_text}");
+        assert!(!out_text.contains("skip.log"), "excluded: {out_text}");
+    }
+
+    /// CLI and project levels combine: each removes its own file in one scan.
+    #[test]
+    fn cli_and_project_excludes_combine_through_scan() {
+        let (_dir, root) = temp_repo();
+        write_untracked(
+            &root,
+            OsStr::new("sentinel.toml"),
+            b"exclude = [\"*.log\"]\n",
+        );
+        write_tracked(
+            &root,
+            OsStr::new("keep.env"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        write_tracked(
+            &root,
+            OsStr::new("skip.log"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        write_tracked(
+            &root,
+            OsStr::new("skip.tmp"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        let (code, out, _) = run_scan(&["scan", "--exclude", "*.tmp"], &root);
+        assert_eq!(code, ExitCode::from(1));
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(out_text.contains("keep.env:1:"), "stdout: {out_text}");
+        assert!(
+            !out_text.contains("skip.log"),
+            "config excluded: {out_text}"
+        );
+        assert!(!out_text.contains("skip.tmp"), "CLI excluded: {out_text}");
+    }
+
+    /// A hostile user config must not leak into the hermetic scan path: with
+    /// an explicit "no user config" the scan reports everything, and only
+    /// an explicitly passed user file suppresses anything.
+    #[test]
+    fn hostile_user_config_leaves_hermetic_scan_unaffected() {
+        let (_dir, root) = temp_repo();
+        write_tracked(
+            &root,
+            OsStr::new("keep.env"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        write_tracked(
+            &root,
+            OsStr::new("skip.log"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        // A hostile user-level config: excludes the only other secret-bearing
+        // file, so any leak of the environment into the scan hides a finding.
+        let xdg = TempDir::new().unwrap();
+        let hostile = xdg.path().join("config.toml");
+        std::fs::write(&hostile, b"exclude = [\"*.log\"]\n").unwrap();
+        let scan_with = |user: Option<PathBuf>| {
+            let args = vec!["scan".to_string()];
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = run_inner(
+                &SecretsEngine::new(),
+                &args,
+                &root,
+                &mut out,
+                &mut err,
+                user,
+            );
+            (code, out, err)
+        };
+        // Hermetic: both findings report, nothing warns on stderr.
+        let (code, out, err) = scan_with(None);
+        assert_eq!(code, ExitCode::from(1));
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(out_text.contains("keep.env:1:"), "stdout: {out_text}");
+        assert!(out_text.contains("skip.log:1:"), "stdout: {out_text}");
+        assert!(String::from_utf8(err).unwrap().is_empty());
+        // Explicit: the same hostile file really excludes `skip.log` —
+        // proving the config is effective, so the hermetic assertion above
+        // is meaningful rather than vacuous.
+        let (code, out, _) = scan_with(Some(hostile));
+        assert_eq!(code, ExitCode::from(1));
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(out_text.contains("keep.env:1:"), "stdout: {out_text}");
+        assert!(!out_text.contains("skip.log"), "excluded: {out_text}");
+    }
+
+    /// A repository with no config file carries no config diagnostics, and an
+    /// empty config is byte-identical to no config at all.
+    #[test]
+    fn no_config_scan_is_silent_and_empty_config_is_identical() {
+        let (_dir, root) = temp_repo();
+        write_tracked(
+            &root,
+            OsStr::new("env.example"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        let plain = run_scan(&["scan"], &root);
+        assert!(String::from_utf8(plain.2.clone()).unwrap().is_empty());
+        write_untracked(&root, OsStr::new("sentinel.toml"), b"exclude = []\n");
+        let with_empty = run_scan(&["scan"], &root);
+        assert_eq!(plain, with_empty, "empty config must change nothing");
+    }
+
+    /// PRESERVE: a non-matching `--exclude` leaves the scan byte-identical
+    /// to the same scan without the flag — the plain path still reports the
+    /// same findings, exit, and (empty) diagnostics.
+    #[test]
+    fn non_matching_exclude_leaves_scan_byte_identical() {
+        let (_dir, root) = secret_repo();
+        let plain = run_scan(&["scan"], &root);
+        let filtered = run_scan(&["scan", "--exclude", "*.nomatch"], &root);
+        assert_eq!(plain, filtered);
+        assert_eq!(plain.0, ExitCode::from(1));
+        assert!(
+            String::from_utf8(plain.1.clone())
+                .unwrap()
+                .contains("SECRET-aws-access-key")
+        );
+    }
+
+    /// PRESERVE: the `--ci` hermetic path is untouched — an untracked secret
+    /// is still found in both modes with the exclude wiring in place, and a
+    /// matching `--exclude` removes it in both modes alike.
+    #[test]
+    fn ci_hermetic_scan_still_holds_with_exclude_wiring() {
+        for extra in [&["scan"][..], &["scan", "--ci"]] {
+            let (_dir, root) = temp_repo();
+            write_tracked(&root, OsStr::new("clean.txt"), b"no secrets");
+            write_untracked(
+                &root,
+                OsStr::new(".env"),
+                b"token = sk-synthetic-1234567890\n",
+            );
+            let found = run_scan(extra, &root);
+            assert_eq!(found.0, ExitCode::from(1), "args {extra:?}");
+            assert!(
+                String::from_utf8(found.1.clone())
+                    .unwrap()
+                    .contains(".env:1:"),
+                "args {extra:?}"
+            );
+            let mut excluded: Vec<&str> = extra.to_vec();
+            excluded.push("--exclude");
+            excluded.push(".env");
+            let hidden = run_scan(&excluded, &root);
+            assert_eq!(hidden.0, ExitCode::SUCCESS, "args {excluded:?}");
+            assert!(hidden.1.is_empty(), "args {excluded:?}");
+        }
     }
 }

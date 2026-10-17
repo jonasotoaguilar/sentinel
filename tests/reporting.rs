@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use tempfile::TempDir;
 
-use sentinel::run as scan_seam;
+use sentinel::run_without_user_config as scan_seam;
 
 mod common;
 use common::{AWS_KEY, TOKEN, git, temp_repo, text_of};
@@ -48,6 +48,8 @@ fn golden_repo() -> (TempDir, PathBuf) {
     (dir, root)
 }
 
+/// Runs the scan in-process over `cwd`, with the user-level configuration
+/// skipped so the developer's own config cannot change what this test scans.
 fn scan(args: &[&str], cwd: &Path) -> (ExitCode, Vec<u8>, Vec<u8>) {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let (mut out, mut err) = (Vec::new(), Vec::new());

@@ -39,6 +39,8 @@ fn scan_bin(cwd: &Path) -> AssertCommand {
         .current_dir(cwd)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("XDG_CONFIG_HOME", cwd)
+        .env_remove("SENTINEL_CONFIG")
         .env("HOME", cwd);
     cmd
 }

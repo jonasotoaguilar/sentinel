@@ -3,9 +3,9 @@
 //!
 //! clap owns parsing; every rejected invocation is a usage error (stderr
 //! diagnostics, empty stdout, exit 2). `--ci`, `--offline`, `--output`,
-//! `--report`, and the advisory-only `--explain` are the only supported
-//! scan options; anything else is rejected, so positional arguments and
-//! unknown flags cannot silently become no-ops. `completions` accepts only
+//! `--report`, `--exclude`, and the advisory-only `--explain` are the only
+//! supported scan options; anything else is rejected, so positional arguments
+//! and unknown flags cannot silently become no-ops. `completions` accepts only
 //! the shells clap_complete generates for this crate.
 
 use std::path::PathBuf;
@@ -49,6 +49,11 @@ pub enum Command {
         /// Report format: terminal, json, or sarif (default terminal).
         #[arg(long, value_enum, default_value = "terminal")]
         output: OutputFormat,
+        /// Exclude files matching a glob from the scan. Repeatable;
+        /// patterns use `.gitignore` semantics and are matched against
+        /// repo-relative paths after `.sentinelignore` and config excludes.
+        #[arg(long, value_name = "GLOB")]
+        exclude: Vec<String>,
         /// Write the machine-readable report to a file instead of stdout.
         #[arg(long, value_name = "PATH")]
         report: Option<PathBuf>,
@@ -203,5 +208,25 @@ mod tests {
             let err = parse(&args(tokens)).unwrap_err();
             assert!(err.use_stderr(), "{tokens:?}");
         }
+    }
+    #[test]
+    fn exclude_flag_is_repeatable_and_defaults_to_empty() {
+        let cli = parse(&args(&["scan"])).unwrap();
+        assert!(matches!(cli.command, Command::Scan { ref exclude, .. } if exclude.is_empty()));
+        let cli = parse(&args(&["scan", "--exclude", "*.log"])).unwrap();
+        assert!(
+            matches!(cli.command, Command::Scan { ref exclude, .. } if exclude == &["*.log".to_string()])
+        );
+        let cli = parse(&args(&[
+            "scan",
+            "--exclude",
+            "*.log",
+            "--exclude",
+            "build/",
+        ]))
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::Scan { ref exclude, .. } if exclude == &["*.log".to_string(), "build/".to_string()])
+        );
     }
 }

@@ -144,13 +144,17 @@ fn secret_repo() -> (TempDir, PathBuf) {
     (dir, root)
 }
 
-/// Runs the binary without any explain configuration.
+/// Runs the binary without any explain configuration. The user-level
+/// sentinel config lookup is pinned at the repository with
+/// `SENTINEL_CONFIG` removed, like every other scan-spawning helper.
 fn scan(root: &Path, args: &[&str]) -> Output {
     let mut cmd = AssertCommand::cargo_bin("sentinel").unwrap();
     cmd.arg("scan")
         .current_dir(root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("XDG_CONFIG_HOME", root)
+        .env_remove("SENTINEL_CONFIG")
         .env("HOME", root);
     cmd.args(args);
     cmd.output().unwrap()
@@ -163,6 +167,8 @@ fn scan_explained(root: &Path, url: &str, args: &[&str]) -> Output {
         .current_dir(root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("XDG_CONFIG_HOME", root)
+        .env_remove("SENTINEL_CONFIG")
         .env("HOME", root)
         .env("SENTINEL_EXPLAIN_URL", url)
         .env("SENTINEL_EXPLAIN_API_KEY", "test-key");
@@ -183,6 +189,8 @@ fn scan_explained_with_env(
         .current_dir(root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("XDG_CONFIG_HOME", root)
+        .env_remove("SENTINEL_CONFIG")
         .env("HOME", root)
         .env("SENTINEL_EXPLAIN_URL", url)
         .env("SENTINEL_EXPLAIN_API_KEY", "test-key");
@@ -548,6 +556,8 @@ fn scan_cached(root: &Path, xdg: &TempDir, args: &[&str]) -> Output {
         .current_dir(root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("XDG_CONFIG_HOME", root)
+        .env_remove("SENTINEL_CONFIG")
         .env("HOME", root)
         .env("XDG_CACHE_HOME", xdg.path());
     cmd.args(args);
@@ -703,6 +713,8 @@ fn fatal_error_path_is_redacted_on_stderr() {
         .current_dir(&cwd)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("XDG_CONFIG_HOME", &cwd)
+        .env_remove("SENTINEL_CONFIG")
         .env("HOME", &cwd);
     let output = cmd.output().unwrap();
     assert_eq!(output.status.code(), Some(2));
@@ -720,6 +732,8 @@ fn usage_error_echoes_no_raw_secret() {
         .current_dir(&root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("XDG_CONFIG_HOME", &root)
+        .env_remove("SENTINEL_CONFIG")
         .env("HOME", &root);
     let output = cmd.output().unwrap();
     assert_eq!(output.status.code(), Some(2));
