@@ -192,11 +192,12 @@ pub fn run_with_deps(
     };
     // The review reads through the original file list, so what is read,
     // cached, and looked up stays byte-identical; only the finding's display
-    // forms (location path, snippet, message, and the fingerprint's path
-    // segment) are redacted here, at the single point every dependency
-    // finding crosses. Snippet and message need the same treatment because a
-    // secret used as a package coordinate travels in them. Secrets and rule
-    // findings arrive already redacted from the scan loop above, so terminal,
+    // forms (location path, snippet, message, rule id, evidence, and the
+    // fingerprint's path segment) are redacted here, at the single point every
+    // dependency finding crosses. Snippet and message need the same treatment
+    // because a secret used as a package coordinate travels in them; rule id
+    // and evidence need it because advisory text is content-derived. Secrets and
+    // rule findings arrive already redacted from the scan loop above, so terminal,
     // JSON, SARIF, report files, and the explain payload that all render from
     // these findings can no longer carry a raw value, and neither can
     // advisory text keyed by finding id. Digests and dedupe keys are
@@ -207,6 +208,8 @@ pub fn run_with_deps(
         finding.location.path = SecretsEngine::redact_production(&finding.location.path);
         finding.location.snippet = SecretsEngine::redact_production(&finding.location.snippet);
         finding.message = SecretsEngine::redact_production(&finding.message);
+        finding.rule_id = SecretsEngine::redact_production(&finding.rule_id);
+        finding.evidence = SecretsEngine::redact_production(&finding.evidence);
         finding.id = SecretsEngine::redact_production(&finding.id);
         finding
     }));
