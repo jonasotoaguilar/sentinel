@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{Explainer, Explanation};
+use super::{ExplainError, Explainer, Explanation};
 use crate::finding::Finding;
 
 /// What the stub answers with: one advisory per finding (`PerFinding`), or a
@@ -50,7 +50,7 @@ impl Explainer for StubExplainer {
         self.configured
     }
 
-    fn explain(&self, findings: &[Finding]) -> Result<Vec<Explanation>, String> {
+    fn explain(&self, findings: &[Finding]) -> Result<Vec<Explanation>, ExplainError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         match &self.outcome {
             StubOutcome::PerFinding(prefix) => Ok(findings

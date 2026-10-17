@@ -24,7 +24,7 @@ use rayon::prelude::*;
 use cli::{Command, OutputFormat};
 use discovery::Discovered;
 use engine::secrets::SecretsEngine;
-use explain::{DisabledExplainer, Explainer};
+use explain::{DisabledExplainer, ExplainError, Explainer};
 use finding::Diagnostic;
 
 /// Runs the scan pipeline and returns the process exit code. Usage errors and
@@ -50,9 +50,15 @@ fn run_inner(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> ExitCode {
-    // No HTTP adapter exists in this unit, so the explainer is always
-    // disabled; PR6 builds it from the environment and calls run_with_deps.
-    run_with_deps(engine, &DisabledExplainer, args, cwd, stdout, stderr)
+    // The HTTP adapter is built once per scan from the environment (D7);
+    // without both variables the disabled explainer keeps the skip path.
+    let http = explain::http::HttpExplainer::from_env();
+    let disabled = DisabledExplainer;
+    let explainer: &dyn Explainer = match &http {
+        Some(adapter) => adapter,
+        None => &disabled,
+    };
+    run_with_deps(engine, explainer, args, cwd, stdout, stderr)
 }
 
 /// The pipeline over an explicit engine and explainer (tests inject the stub,
@@ -166,15 +172,23 @@ pub fn run_with_deps(
     let mut advisories: BTreeMap<String, String> = BTreeMap::new();
     if explain && !ci && !offline {
         if explainer.is_configured() {
-            // A failed call degrades to no advisories; PR6 reports it as
-            // `explain-failed` instead of staying silent.
-            if let Ok(explanations) = explainer.explain(&findings) {
-                for explanation in explanations {
-                    if findings.iter().any(|f| f.id == explanation.finding_id) {
-                        advisories
-                            .entry(explanation.finding_id)
-                            .or_insert(explanation.text);
+            // One attempt: transport failures and malformed bodies degrade
+            // to warnings, never to a retry or an exit change.
+            match explainer.explain(&findings) {
+                Ok(explanations) => {
+                    for explanation in explanations {
+                        if findings.iter().any(|f| f.id == explanation.finding_id) {
+                            advisories
+                                .entry(explanation.finding_id)
+                                .or_insert(explanation.text);
+                        }
                     }
+                }
+                Err(ExplainError::Failed(message)) => {
+                    diagnostics.push(Diagnostic::explain_failed(&message));
+                }
+                Err(ExplainError::Invalid(message)) => {
+                    diagnostics.push(Diagnostic::explain_invalid(&message));
                 }
             }
         } else {
