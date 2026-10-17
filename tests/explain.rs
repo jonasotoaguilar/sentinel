@@ -125,7 +125,7 @@ where
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("HOME", cwd)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .status()
         .unwrap();
     assert!(status.success(), "git failed in {cwd:?}");
@@ -631,15 +631,13 @@ fn skipped_large_path_is_redacted_on_stderr() {
     let (dir, root) = temp_repo();
     let name = format!("{AWS_KEY}.bin");
     let path = root.join(&name);
-    std::fs::write(&path, b"").unwrap();
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
+    std::fs::File::create(&path)
         .unwrap()
         .set_len(10 * 1024 * 1024)
         .unwrap();
+    // Discovery enumerates the index (`ls-files`), so staging is what makes the
+    // file tracked; a commit would need an identity this helper strips.
     git(&root, ["add", "--", name.as_str()]);
-    git(&root, ["commit", "-qm", "big"]);
     let output = scan(&root, &[]);
     assert!(
         !text_of(&output.stderr).contains(AWS_KEY),
