@@ -127,7 +127,10 @@ fn sarif_golden_matches_reviewable_snapshot() {
     let (_dir, root) = golden_repo();
     let (code, stdout, _) = scan(&["scan", "--output", "sarif"], &root);
     assert_eq!(code, ExitCode::from(1));
-    insta::assert_snapshot!("sarif_golden_corpus", text_of(&stdout));
+    // Same reasoning as the JSON snapshot: the corpus covers the findings, and
+    // the crate version is asserted in tests/cli.rs.
+    let text = text_of(&stdout).replace(env!("CARGO_PKG_VERSION"), "<version>");
+    insta::assert_snapshot!("sarif_golden_corpus", text);
 }
 
 #[test]
