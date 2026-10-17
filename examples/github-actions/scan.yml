@@ -1,0 +1,44 @@
+# Example: scan a repository with the Sentinel action and upload SARIF.
+#
+# Copy this file to `.github/workflows/sentinel.yml` in your repository. To
+# try it in this repository without a published tag, replace the `uses` line
+# with `./.github/actions/sentinel-scan` (a local path works because the
+# action and the workflow share a checkout).
+
+name: Sentinel scan
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  sentinel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # security-events: write is required for the action's SARIF upload to
+      # code scanning. contents: read is inherited from the workflow level.
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - id: scan
+        name: Scan with Sentinel
+        # Pinned to the branch because the action does not exist in a released
+        # tag yet; once it ships in one, pin that tag instead.
+        uses: jonasotoaguilar/sentinel/.github/actions/sentinel-scan@main
+        with:
+          version: latest
+          fail-on-findings: true
+          upload-sarif: true
+
+      - name: Report scan outcome
+        if: always()
+        run: |
+          echo "exit code: ${{ steps.scan.outputs.exit-code }}"
+          echo "findings: ${{ steps.scan.outputs.findings-count }}"
+          echo "sarif: ${{ steps.scan.outputs.sarif-file }}"
