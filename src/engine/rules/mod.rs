@@ -1,6 +1,7 @@
 //! Code-rules engine (PR1 skeleton plus the JavaScript/TypeScript rule set);
 //! Python rules arrive as further entries in the rule table.
 
+pub mod fallback;
 pub mod javascript;
 pub mod lang;
 pub mod python;
@@ -49,6 +50,7 @@ const RULE_DEFS: &[RuleDef] = &[
 /// The code-rules engine over a compiled rule table.
 pub struct RulesEngine {
     rules: Vec<RuleDef>,
+    fallback: Vec<fallback::CompiledFallback>,
     redactor: SecretsEngine,
     init_diagnostics: Vec<Diagnostic>,
 }
@@ -76,8 +78,13 @@ impl RulesEngine {
             }
             rules.push(*def);
         }
+        // Fallback entries compile with the same containment: one
+        // `rule-failed` diagnostic per bad pattern, the rest still run.
+        let (fallback, fallback_diagnostics) = fallback::compile_fallback(fallback::FALLBACK_DEFS);
+        init_diagnostics.extend(fallback_diagnostics);
         Self {
             rules,
+            fallback,
             redactor: SecretsEngine::new(),
             init_diagnostics,
         }
@@ -90,27 +97,46 @@ impl RulesEngine {
 
     /// Scans one file; unsupported extensions and languages without rules
     /// return no candidates without any parse attempt. Candidates carry
-    /// only redacted text and the pre-redaction digest.
+    /// only redacted text and the pre-redaction digest. This is a thin
+    /// wrapper: parse-failure diagnostics are discarded, use
+    /// [`RulesEngine::scan_with_diagnostics`] when they matter.
+    #[cfg(test)]
     pub fn scan(&self, path: &str, bytes: &[u8]) -> Vec<Candidate> {
+        self.scan_with_diagnostics(path, bytes).0
+    }
+
+    /// Scans one file with its diagnostics. A file the grammar cannot
+    /// parse — no tree, or a tree whose root reports an error — degrades
+    /// to the conservative fallback for that file only: no AST rule runs
+    /// on the untrustworthy tree, and exactly one `rule-fallback`
+    /// diagnostic names the path.
+    pub fn scan_with_diagnostics(
+        &self,
+        path: &str,
+        bytes: &[u8],
+    ) -> (Vec<Candidate>, Vec<Diagnostic>) {
         let Some(language) = lang::detect(path) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         if !self
             .rules
             .iter()
             .any(|rule| rule.languages.contains(&language))
         {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let mut parser = Parser::new();
         if parser.set_language(grammar(language)).is_err() {
             // Grammars are compiled in and validated at construction;
             // stay silent rather than invent a finding.
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let Some(tree) = parser.parse(bytes, None) else {
-            return Vec::new();
+            return self.fallback_for(path, language, bytes);
         };
+        if tree.root_node().has_error() {
+            return self.fallback_for(path, language, bytes);
+        }
         let root = tree.root_node();
         let mut candidates = Vec::new();
         for rule in &self.rules {
@@ -118,18 +144,56 @@ impl RulesEngine {
                 continue;
             }
             for hit in (rule.matches)(bytes, root) {
-                candidates.push(self.candidate(rule, bytes, hit));
+                candidates.push(self.candidate(rule.id, rule.severity, rule.message, bytes, hit));
             }
         }
-        candidates
+        (candidates, Vec::new())
     }
 
-    fn candidate(&self, rule: &RuleDef, bytes: &[u8], hit: Hit) -> Candidate {
+    /// Conservative regex coverage for one unparseable file, gated by the
+    /// file's language like the AST rules.
+    fn fallback_for(
+        &self,
+        path: &str,
+        language: lang::RulesLanguage,
+        bytes: &[u8],
+    ) -> (Vec<Candidate>, Vec<Diagnostic>) {
+        let diagnostic =
+            Diagnostic::rule_fallback(path, "parse failed; applied conservative fallback");
+        let mut candidates = Vec::new();
+        for rule in &self.fallback {
+            if !rule.rule.languages.contains(&language) {
+                continue;
+            }
+            for (start, end) in rule.find_ranges(bytes) {
+                candidates.push(self.candidate(
+                    rule.rule.id,
+                    rule.rule.severity,
+                    rule.rule.message,
+                    bytes,
+                    Hit { start, end },
+                ));
+            }
+        }
+        (candidates, vec![diagnostic])
+    }
+
+    /// Builds one candidate through the shared boundary: the matched
+    /// line redacted with the secrets table, the digest over the
+    /// pre-redaction bytes.
+    fn candidate(
+        &self,
+        id: &'static str,
+        severity: Severity,
+        message: &'static str,
+        bytes: &[u8],
+        hit: Hit,
+    ) -> Candidate {
         let (line, column) = locate(bytes, hit.start);
         Candidate {
-            rule_id: rule.id.to_string(),
-            severity: rule.severity,
-            message: rule.message.to_string(),
+            rule_id: id.to_string(),
+            severity,
+            message: message.to_string(),
             line,
             column,
             snippet: self.redactor.redact(&line_text(bytes, hit.start)),

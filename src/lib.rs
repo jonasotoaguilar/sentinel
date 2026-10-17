@@ -95,15 +95,22 @@ fn run_inner(
             let path_text = path.to_string_lossy().replace('\\', "/");
             let bytes = std::fs::read(root.join(path))
                 .map_err(|error| Diagnostic::read_failed(&path_text, &error))?;
-            let rule_candidates = rules_engine.scan(&path_text, &bytes);
-            Ok((path_text, engine.scan(&bytes), rule_candidates))
+            let (rule_candidates, rule_diagnostics) =
+                rules_engine.scan_with_diagnostics(&path_text, &bytes);
+            Ok((
+                path_text,
+                engine.scan(&bytes),
+                rule_candidates,
+                rule_diagnostics,
+            ))
         })
         .collect::<Vec<_>>();
 
     let mut findings = Vec::new();
     for scan in scans {
         match scan {
-            Ok((path, secret_candidates, rule_candidates)) => {
+            Ok((path, secret_candidates, rule_candidates, rule_diagnostics)) => {
+                diagnostics.extend(rule_diagnostics);
                 findings.extend(normalize::to_findings(&path, secret_candidates));
                 findings.extend(normalize::to_findings_for(
                     crate::engine::ENGINE_RULES,
