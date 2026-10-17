@@ -2,7 +2,7 @@
 
 Sentinel is a cross-platform Rust CLI that scans Git repositories for secrets and vulnerable dependencies before commit or in CI.
 
-> **Status: MVP implemented.** Sentinel scans Git repositories for secrets, vulnerable dependencies, and code-rule violations. The commands below are shipped functionality; the roadmap (rules engine, explain adapter, shell completions) is delivered and archived under `openspec/changes/archive/`.
+> **Status: MVP implemented.** Sentinel scans Git repositories for secrets, vulnerable dependencies, and code-rule violations. The commands below are shipped functionality; the roadmap (rules engine, explain adapter, shell completions) is delivered on `main`.
 
 ## What Is This?
 
@@ -10,7 +10,7 @@ Sentinel runs a scan over a Git repository and reports findings in a reviewable 
 
 - **Secrets & credentials** — detection of API keys, tokens, and other credentials in tracked files.
 - **Vulnerable dependencies** — review of declared dependencies against the OSV API v1 advisory database.
-- **Deterministic rules** — regex and Tree-sitter AST rules for an initial set of JavaScript/TypeScript and Python.
+- **Deterministic rules** — Tree-sitter AST rules for JavaScript/TypeScript and Python.
 - **Multiple outputs** — human-friendly terminal output, versioned JSON, and SARIF 2.1.0 for CI integrations.
 - **Optional `--explain`** — an opt-in LLM adapter that adds context to findings. It is advisory only: it never sets severity or blocking, redacts secrets, limits context size, and is disabled by default in CI and offline mode.
 

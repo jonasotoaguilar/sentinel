@@ -96,4 +96,3 @@ The product's differentiator is trust: deterministic, auditable, local-first sca
 ## References
 - PRD §1 (KPI 3), §3 (in scope / non-goal), §4 (product rules), §5 (acceptance criteria), §7 (risk register)
 - ARCHITECTURE.md — Explain Adapter, Key Decisions, Failure Modes
-- design-architecture references: module-design.md (seam rule), nfr-checklist.md (trust boundaries), api-design.md (validate at trust boundaries)

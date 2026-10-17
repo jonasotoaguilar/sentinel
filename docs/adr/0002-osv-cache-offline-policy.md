@@ -107,4 +107,3 @@ The product rule "offline serves from cache and warns/skips gracefully" forces a
 ## References
 - PRD §3 (OSV API v1 in scope), §4 (offline product rule), §6 (pagination/detail-fetch research constraint)
 - ARCHITECTURE.md — XDG Advisory Cache, OSV API v1 Client, Data Architecture, Failure Modes
-- design-architecture references: architecture-patterns.md (caching decisions: source of truth, staleness, stampede, failure behavior), resilience-patterns.md (dependency failure budget)

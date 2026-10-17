@@ -93,4 +93,3 @@ The deciding force is lifecycle: the product runs once, prints, and exits. Every
 ## References
 - PRD §3 MVP Scope (in scope / non-goals), §5 Acceptance Criteria
 - ARCHITECTURE.md — Architecture Pattern, Key Decisions
-- design-architecture references: architecture-patterns.md (modular monolith guardrails), module-design.md (boundaries)

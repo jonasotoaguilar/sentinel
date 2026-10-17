@@ -1,6 +1,6 @@
 # ARCHITECTURE.md
 
-> **Status**: Review &nbsp;|&nbsp; **Last updated**: 2026-08-04 &nbsp;|&nbsp; **Author**: Jonathan Soto (architecture owner, design-architecture delegation)
+> **Status**: Implemented &nbsp;|&nbsp; **Last updated**: 2026-10-17 &nbsp;|&nbsp; **Author**: Jonathan Soto (architecture owner)
 
 ### Section Map — applicability
 
@@ -204,7 +204,7 @@ classDiagram
 All engines share one contract: file or manifest input → zero or more **raw findings** with engine-local rule IDs and severity, with secret values **redacted at this boundary** (raw values never leave an engine). Engines are independent — one engine failing does not affect the others.
 
 - **Secrets engine (regex)**: curated regex rule set for API keys, tokens, and credentials over file bytes; emits redacted evidence only.
-- **Rules engine (Tree-sitter)**: AST rules for JavaScript/TypeScript and Python; an unparseable file is skipped with one `rule-fallback` diagnostic, never a scan abort. Detects vulnerable patterns the regex layer cannot express (e.g., weak crypto API misuse within scope of MVP rule set).
+- **Rules engine (Tree-sitter)**: AST rules for JavaScript/TypeScript and Python; an unparseable file is skipped with one `rule-fallback` diagnostic, never a scan abort. Detects vulnerable patterns a byte-pattern regex cannot express (e.g., weak crypto API misuse within scope of MVP rule set).
 - **Dependency engine**: resolves declared dependencies from supported manifests (npm family for JS/TS, PyPI for Python) into canonical `(ecosystem, package, version)` triples, then queries the OSV adapter. Offline or degraded → warns and skips dependency findings; never fails the scan.
 
 - **Technology**: Rust, rayon, regex, tree-sitter (JS/TS/Python grammars), serde/toml for manifests.
@@ -324,7 +324,7 @@ All engines share one contract: file or manifest input → zero or more **raw fi
 
 ### Supply Chain / Release
 
-- Release artifacts signed, checksummed, and shipped with an SBOM (README commitment) — recorded here at architecture level; workflow files themselves are owned by the github-environment skill, out of scope for this document.
+- Release artifacts signed, checksummed, and shipped with an SBOM (README commitment) — recorded here at architecture level; the workflow files themselves are out of scope for this document.
 - Dependency provenance: registries only (crates.io), lockfile committed; vulnerability scanning of Sentinel's own dependencies on every build.
 
 ---
@@ -391,7 +391,7 @@ The versioned JSON output is a stable machine contract for tooling; its stabilit
 - **Snapshots (insta)**: golden files for terminal renderer, versioned JSON envelope, and SARIF output; SARIF additionally validated against the 2.1.0 schema.
 - **Fixtures (tempfile + committed corpus)**: synthetic secrets (never real credentials), manifests with pinned known-OSV-ID vulnerable versions, intentional parse-failure files, corrupt cache entries, and ambient-ignore trees. The OSV integration corpus is exercised against the stub server with cached OSV fixture responses — no network in tests.
 - **Determinism gate**: every CI test job that produces output runs the scan twice and byte-compares.
-- **Cross-platform**: the suite runs on Linux, macOS, and Windows (line-ending normalization and path handling are exercised per-OS; workflows are owned by github-environment).
+- **Cross-platform**: the suite runs on Linux, macOS, and Windows (line-ending normalization and path handling are exercised per-OS).
 
 ### Explicitly out of scope (future expansion)
 

@@ -2,7 +2,7 @@
 
 Sentinel is a cross-platform Rust CLI that scans Git repositories for secrets and vulnerable dependencies before commit or in CI. It gives developers and pipelines a deterministic, reviewable security check with no server, no database, and no mandatory third-party calls — and an opt-in LLM explainer that can add context without ever dictating severity.
 
-> **Status: MVP implemented.** This document is the product source of truth for the MVP; the roadmap it names (rules engine, explain adapter, shell completions) is delivered on `main` and archived under `openspec/changes/archive/`.
+> **Status: MVP implemented.** This document is the product source of truth for the MVP; the roadmap it names (rules engine, explain adapter, shell completions) is delivered on `main`.
 
 ## Quick Path
 
@@ -23,7 +23,7 @@ Sentinel is a cross-platform Rust CLI that scans Git repositories for secrets an
 ## 1. Executive Summary
 
 - **Problem Statement**: Secrets and vulnerable dependencies frequently reach commits because existing checks are centralized (server/daemon), noisy, or lack deterministic rules — and when LLM assistance is added, it often gets to decide outcomes.
-- **Proposed Solution**: A single-crate Rust CLI (`sentinel scan`) that scans a repository in memory using git-aware discovery, parallel detector engines (secrets, OSV dependency review, regex/Tree-sitter rules for JS/TS and Python), stable fingerprinting/deduplication, and terminal/JSON/SARIF 2.1.0 output. Optional `--explain` adds LLM context over HTTP with strict guardrails.
+- **Proposed Solution**: A single-crate Rust CLI (`sentinel scan`) that scans a repository in memory using git-aware discovery, parallel detector engines (secrets, OSV dependency review, Tree-sitter AST rules for JS/TS and Python), stable fingerprinting/deduplication, and terminal/JSON/SARIF 2.1.0 output. Optional `--explain` adds LLM context over HTTP with strict guardrails.
 - **Success Criteria**:
   - KPI 1: Scan completes in under a minute on a typical repository (tens of thousands of files) on a mid-range machine.
   - KPI 2: Findings are deterministic and deduplicated via stable fingerprints; identical scans produce identical results.
@@ -53,7 +53,7 @@ Sentinel is a cross-platform Rust CLI that scans Git repositories for secrets an
 - Git-aware discovery of repository files (via `git`, `std::process::Command`).
 - Secret/credential detection engine.
 - Vulnerable dependency review against the OSV API v1 (batch query + detail fetches; results cached in XDG cache).
-- Deterministic regex and Tree-sitter AST rules for initial JavaScript/TypeScript and Python.
+- Deterministic Tree-sitter AST rules for JavaScript/TypeScript and Python.
 - Parallel execution of detector engines (Rayon).
 - Stable fingerprinting and deduplication of findings across engines and runs.
 - Renderers: terminal, versioned JSON, SARIF 2.1.0.
@@ -117,20 +117,20 @@ Sentinel is a cross-platform Rust CLI that scans Git repositories for secrets an
 
 These are candidate directions for later phases, explicitly not part of the MVP:
 
-- **Deeper JS/TS analysis** via oxc-based parsing, superseding/augmenting initial regex/Tree-sitter rules.
+- **Deeper JS/TS analysis** via oxc-based parsing, superseding/augmenting the initial Tree-sitter rules.
 - **More ecosystems**: additional languages, package managers, and advisory sources.
 - **Optional LLM enhancements**: richer explanation modes and source-aware context — still governed by the rule that the LLM never sets severity or blocking.
 
-Each phase is gated on MVP acceptance criteria passing and its own scope decision; nothing above is promised by the MVP. The MVP roadmap itself — rules engine, explain adapter, shell completions — is delivered and archived under `openspec/changes/archive/2026-10-17-*/`.
+Each phase is gated on MVP acceptance criteria passing and its own scope decision; nothing above is promised by the MVP. The MVP roadmap itself — rules engine, explain adapter, shell completions — is delivered on `main`.
 
 ## Checklist
 
-- [ ] Problem is stated before solution detail.
-- [ ] Success criteria are measurable.
-- [ ] Non-goals are explicit and reviewed.
-- [ ] Product rules (`--explain`, redaction, offline) are unambiguous.
-- [ ] Future work is staged and labeled as non-commitments.
+- [x] Problem is stated before solution detail.
+- [x] Success criteria are measurable.
+- [x] Non-goals are explicit and reviewed.
+- [x] Product rules (`--explain`, redaction, offline) are unambiguous.
+- [x] Future work is staged and labeled as non-commitments.
 
 ## Next Step
 
-Design and architecture work (ARCHITECTURE.md, ADRs, system/API decisions) belongs to `design-architecture`; this PRD is its source of truth. Implementation planning starts only after MVP scope and acceptance criteria are approved.
+Design and architecture work (ARCHITECTURE.md, ADRs, system/API decisions) keeps this document as its source of truth. Work is planned and tracked as ODD feature documents under `odd/tasks/`.
