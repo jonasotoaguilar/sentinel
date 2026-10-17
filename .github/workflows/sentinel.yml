@@ -1,0 +1,58 @@
+name: Sentinel self-scan
+
+# This repository runs its own published action on itself. Two reasons, in
+# order of importance: a composite action only exists on a runner, so this is
+# the only place the action's inputs, outputs, PATH propagation and SARIF
+# upload can be proven at all; and a scanner that does not scan its own
+# repository is asking for trust it does not extend to itself.
+#
+# The local path is used rather than the published ref, so this validates the
+# action as it exists in the tree. Consumers reference it as
+# `jonasotoaguilar/sentinel/.github/actions/sentinel-scan@<ref>`.
+#
+# Findings do not fail the job on purpose. This repository's fixtures contain
+# synthetic secrets and a deliberately vulnerable pinned dependency, so a
+# blocking scan would fail every pull request for reasons that are the point of
+# the fixtures. The report goes to code scanning, where findings are visible
+# and reviewable, and the exit code is still an output of the step.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: sentinel-self-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: scan this repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run the action
+        id: sentinel
+        uses: ./.github/actions/sentinel-scan
+        with:
+          fail-on-findings: 'false'
+          upload-sarif: 'true'
+
+      - name: Report what the action produced
+        run: |
+          set -euo pipefail
+          echo "exit code:      ${{ steps.sentinel.outputs.exit-code }}"
+          echo "findings count: ${{ steps.sentinel.outputs.findings-count }}"
+          echo "sarif file:     ${{ steps.sentinel.outputs.sarif-file }}"
+          test -f "${{ steps.sentinel.outputs.sarif-file }}" || {
+            echo "::error::the action reported a SARIF file that does not exist"
+            exit 1
+          }
