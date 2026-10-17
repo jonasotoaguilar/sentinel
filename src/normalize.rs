@@ -10,22 +10,19 @@ use crate::engine;
 use crate::engine::secrets::Candidate;
 use crate::finding::{Finding, Location};
 
-/// Converts the redacted candidates of one path into findings; raw values
-/// are already gone at the engine boundary; only the digest participates.
-pub fn to_findings(path: &str, candidates: Vec<Candidate>) -> Vec<Finding> {
+/// Converts the redacted candidates of one path into findings for the
+/// given engine; raw values are already gone at the engine boundary;
+/// only the digest participates.
+pub fn to_findings_for(engine: &str, path: &str, candidates: Vec<Candidate>) -> Vec<Finding> {
     let path = path.replace('\\', "/");
     candidates
         .into_iter()
         .map(|candidate| Finding {
             id: format!(
-                "{}/{}/{path}:{}:{}/{}",
-                engine::ENGINE,
-                candidate.rule_id,
-                candidate.line,
-                candidate.column,
-                candidate.digest
+                "{engine}/{}/{path}:{}:{}/{}",
+                candidate.rule_id, candidate.line, candidate.column, candidate.digest
             ),
-            engine: engine::ENGINE.to_string(),
+            engine: engine.to_string(),
             rule_id: candidate.rule_id,
             severity: candidate.severity,
             location: Location {
@@ -38,6 +35,12 @@ pub fn to_findings(path: &str, candidates: Vec<Candidate>) -> Vec<Finding> {
             evidence: candidate.evidence,
         })
         .collect()
+}
+
+/// Converts the redacted candidates of one path into findings; raw values
+/// are already gone at the engine boundary; only the digest participates.
+pub fn to_findings(path: &str, candidates: Vec<Candidate>) -> Vec<Finding> {
+    to_findings_for(engine::ENGINE, path, candidates)
 }
 
 /// Deduplicates by fingerprint (one finding per distinct detection) and
@@ -101,6 +104,18 @@ mod tests {
         ] {
             assert!(!field.contains(RAW), "raw value leaked via {field:?}");
         }
+    }
+
+    #[test]
+    fn to_findings_for_tags_the_calling_engine() {
+        let finding = &to_findings_for(
+            crate::engine::ENGINE_RULES,
+            "a.js",
+            vec![candidate("RULE-x", "d1")],
+        )[0];
+        assert_eq!(finding.engine, "rules");
+        assert!(finding.id.starts_with("rules/RULE-x/a.js:3:5/d1"));
+        assert_eq!(finding.rule_id, "RULE-x");
     }
 
     #[test]

@@ -116,6 +116,45 @@ impl SecretsEngine {
         &self.init_diagnostics
     }
 
+    /// Applies the compiled secrets table to arbitrary text, replacing
+    /// every match with [`REDACTION_PLACEHOLDER`]; the shared redaction
+    /// pass other engines apply at their own boundary.
+    #[allow(dead_code)] // Consumed by the rules engine in the next work unit of this chain.
+    pub fn redact(&self, text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for rule in &self.rules {
+            for matched in rule.regex.find_iter(bytes) {
+                ranges.push((matched.start(), matched.end()));
+            }
+        }
+        if ranges.is_empty() {
+            return text.to_string();
+        }
+        ranges.sort();
+        // Merge strictly overlapping spans so one placeholder covers
+        // them; adjacent spans stay distinct (one placeholder each).
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            if let Some(last) = merged.last_mut()
+                && start < last.1
+            {
+                last.1 = last.1.max(end);
+                continue;
+            }
+            merged.push((start, end));
+        }
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut cursor = 0;
+        for (start, end) in merged {
+            out.extend_from_slice(&bytes[cursor..start]);
+            out.extend_from_slice(REDACTION_PLACEHOLDER.as_bytes());
+            cursor = end;
+        }
+        out.extend_from_slice(&bytes[cursor..]);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
     /// Resolves a rule id or a deprecated alias to its rule.
     #[allow(dead_code)] // Query surface for the renamed-rule scenario; tests.
     pub fn resolve(&self, id: &str) -> Option<&Rule> {
@@ -139,7 +178,7 @@ impl SecretsEngine {
 
 /// BLAKE3 hex over the length-prefixed canonical matched bytes (u64 LE
 /// length prefix fixes the encoding), computed before redaction.
-fn digest_of(matched: &[u8]) -> String {
+pub(crate) fn digest_of(matched: &[u8]) -> String {
     let mut input = Vec::with_capacity(8 + matched.len());
     input.extend_from_slice(&(matched.len() as u64).to_le_bytes());
     input.extend_from_slice(matched);
@@ -160,12 +199,11 @@ fn candidate(rule: &Rule, bytes: &[u8], matched: regex::bytes::Match) -> Candida
     }
 }
 
-/// 1-based (line, byte column) of an offset within the input.
-fn locate(bytes: &[u8], offset: usize) -> (u64, u64) {
-    let line_start = bytes[..offset]
-        .iter()
-        .rposition(|&byte| byte == b'\n')
-        .map_or(0, |index| index + 1);
+/// 1-based (line, byte column) of an offset within the input; the shared
+/// location primitive the engines build on at their boundary.
+pub(crate) fn locate(bytes: &[u8], offset: usize) -> (u64, u64) {
+    let offset = offset.min(bytes.len());
+    let line_start = line_bounds(bytes, offset).0;
     let line = 1 + bytes[..offset]
         .iter()
         .filter(|&&byte| byte == b'\n')
@@ -173,21 +211,35 @@ fn locate(bytes: &[u8], offset: usize) -> (u64, u64) {
     (line, (offset - line_start + 1) as u64)
 }
 
-/// The line containing the match, CR normalized to LF, with every occurrence
-/// of the matched bytes replaced by the placeholder.
-fn redact_line(bytes: &[u8], matched: regex::bytes::Match) -> String {
-    let line_start = bytes[..matched.start()]
+/// Byte range of the line containing `offset`, excluding its newline.
+fn line_bounds(bytes: &[u8], offset: usize) -> (usize, usize) {
+    let start = bytes[..offset]
         .iter()
         .rposition(|&byte| byte == b'\n')
         .map_or(0, |index| index + 1);
-    let line_end = bytes[matched.start()..]
+    let end = bytes[offset..]
         .iter()
         .position(|&byte| byte == b'\n')
-        .map_or(bytes.len(), |index| matched.start() + index);
-    let mut line = bytes[line_start..line_end].to_vec();
+        .map_or(bytes.len(), |index| offset + index);
+    (start, end)
+}
+
+/// The line containing `offset`, CR normalized to LF and lossy decoded; the
+/// shared snippet primitive the rules engine reads its evidence lines with.
+pub(crate) fn line_text(bytes: &[u8], offset: usize) -> String {
+    let offset = offset.min(bytes.len());
+    let (start, end) = line_bounds(bytes, offset);
+    let mut line = bytes[start..end].to_vec();
     if line.last() == Some(&b'\r') {
         line.pop();
     }
+    String::from_utf8_lossy(&line).into_owned()
+}
+
+/// The line containing the match, CR normalized to LF, with every occurrence
+/// of the matched bytes replaced by the placeholder.
+fn redact_line(bytes: &[u8], matched: regex::bytes::Match) -> String {
+    let line = line_text(bytes, matched.start()).into_bytes();
     let redacted = replace_all(
         &line,
         &bytes[matched.start()..matched.end()],
@@ -239,6 +291,29 @@ mod tests {
         assert_eq!(current.id, "SECRET-aws-access-key");
         assert_eq!(engine.resolve("SECRET-aws-key-id").unwrap().id, current.id);
         assert!(engine.resolve("SECRET-unknown").is_none());
+    }
+
+    #[test]
+    fn redact_replaces_every_match_with_the_placeholder() {
+        let engine = SecretsEngine::new();
+        assert_eq!(engine.redact("no secrets here"), "no secrets here");
+        assert_eq!(
+            engine.redact(&format!("key {SYNTHETIC} end")),
+            format!("key {REDACTION_PLACEHOLDER} end")
+        );
+        // Every occurrence is replaced, each with its own placeholder.
+        assert_eq!(
+            engine.redact(&format!("{SYNTHETIC} {SYNTHETIC}")),
+            format!("{REDACTION_PLACEHOLDER} {REDACTION_PLACEHOLDER}")
+        );
+    }
+
+    #[test]
+    fn line_text_returns_the_line_and_normalizes_cr() {
+        let bytes = b"first\r\nsecond line\nthird";
+        assert_eq!(line_text(bytes, 0), "first");
+        assert_eq!(line_text(bytes, 9), "second line");
+        assert_eq!(line_text(bytes, bytes.len()), "third");
     }
 
     #[test]
