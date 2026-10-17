@@ -18,7 +18,7 @@ use assert_cmd::Command as AssertCommand;
 use regex::Regex;
 use tempfile::TempDir;
 
-use sentinel::run as scan_seam;
+use sentinel::run_without_user_config as scan_seam;
 
 mod common;
 use common::{AWS_KEY, TOKEN, git, temp_repo, text_of};
@@ -65,20 +65,27 @@ fn golden_repo() -> (TempDir, PathBuf) {
     (dir, root)
 }
 
-/// The scan binary with a hermetic git environment; callers may override
-/// cwd, HOME, or PATH.
+/// The scan binary with a hermetic git and config environment: no
+/// system/global git config, and the user-level sentinel config lookup
+/// pinned at the repository (plus `SENTINEL_CONFIG` removed), so neither
+/// the developer's nor the CI runner's config can change what the test
+/// scans. Callers may override cwd, HOME, or PATH.
 fn scan_bin(cwd: &Path) -> AssertCommand {
     let mut cmd = AssertCommand::cargo_bin("sentinel").unwrap();
     cmd.arg("scan")
         .current_dir(cwd)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("XDG_CONFIG_HOME", cwd)
+        .env_remove("SENTINEL_CONFIG")
         .env("HOME", cwd);
     cmd
 }
 
 /// Runs the scan pipeline in-process over `cwd`; returns (exit, stdout,
-/// stderr) without spawning a process.
+/// stderr) without spawning a process. The user-level configuration is
+/// skipped on purpose, so a config file in the developer's home directory
+/// cannot change what this test scans.
 fn scan_seam_in(args: &[&str], cwd: &Path) -> (ExitCode, Vec<u8>, Vec<u8>) {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());

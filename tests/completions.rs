@@ -8,13 +8,17 @@ use std::path::Path;
 use assert_cmd::Command as AssertCommand;
 use tempfile::TempDir;
 
-/// The sentinel binary with a hermetic git environment, like `scan_bin`.
+/// The sentinel binary with a hermetic git and config environment, like
+/// `scan_bin`: the user-level config lookup stays pinned at the
+/// repository even though this helper only drives `completions`.
 fn sentinel_bin(cwd: &Path, args: &[&str]) -> AssertCommand {
     let mut cmd = AssertCommand::cargo_bin("sentinel").unwrap();
     cmd.args(args)
         .current_dir(cwd)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("XDG_CONFIG_HOME", cwd)
+        .env_remove("SENTINEL_CONFIG")
         .env("HOME", cwd);
     cmd
 }

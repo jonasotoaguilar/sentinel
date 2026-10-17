@@ -423,6 +423,61 @@ fn walk_error_path(error: &ignore::Error) -> Option<&Path> {
     }
 }
 
+/// Removes files matching any of `patterns` (`.gitignore` semantics against
+/// repo-relative paths) from an already-discovered file set. Empty patterns
+/// keep every file with no diagnostics; an unusable pattern warns once with
+/// `exclude-invalid` and is otherwise ignored. Never touches parent or global
+/// ignore sources, so `--ci` stays hermetic when the caller passes the same
+/// merged excludes in both modes.
+pub fn apply_excludes(
+    root: &Path,
+    files: Vec<PathBuf>,
+    patterns: &[String],
+) -> (Vec<PathBuf>, Vec<Diagnostic>) {
+    if patterns.is_empty() {
+        return (files, Vec::new());
+    }
+    let mut builder = GitignoreBuilder::new(root);
+    let mut diagnostics = Vec::new();
+    for pattern in patterns {
+        // `None` anchors the pattern to the repository root, mirroring how
+        // the walker's `.sentinelignore` lines apply without a file context.
+        if let Err(error) = builder.add_line(None, pattern) {
+            diagnostics.push(Diagnostic {
+                code: "exclude-invalid",
+                path: pattern.clone(),
+                rule: String::new(),
+                message: error.to_string(),
+            });
+        }
+    }
+    let matcher = match builder.build() {
+        Ok(matcher) => matcher,
+        Err(error) => {
+            diagnostics.push(Diagnostic {
+                code: "exclude-invalid",
+                path: String::new(),
+                rule: String::new(),
+                message: error.to_string(),
+            });
+            diagnostics.sort();
+            diagnostics.dedup();
+            return (files, diagnostics);
+        }
+    };
+    let kept = files
+        .into_iter()
+        .filter(|rel| {
+            !matcher
+                .matched_path_or_any_parents(root.join(rel), false)
+                .is_ignore()
+        })
+        .collect();
+    diagnostics.sort();
+    diagnostics.dedup();
+    (kept, diagnostics)
+}
+
 /// Builds a `.sentinelignore` matcher over every ignore file found by the
 /// walk, mirroring the walker's nested-file precedence when post-filtering
 /// tracked paths. Returns `None` when no `.sentinelignore` exists; unreadable
@@ -1004,5 +1059,32 @@ mod tests {
             }
             Ok(_) => panic!("missing file must report an I/O error"),
         }
+    }
+
+    #[test]
+    fn apply_excludes_removes_matching_files_with_gitignore_semantics() {
+        let (_dir, root) = temp_repo();
+        let files = vec![
+            PathBuf::from("keep.rs"),
+            PathBuf::from("debug.log"),
+            PathBuf::from("build/out.txt"),
+            PathBuf::from("src/main.rs"),
+        ];
+        let (kept, diagnostics) =
+            super::apply_excludes(&root, files, &["*.log".to_string(), "build/".to_string()]);
+        assert_eq!(
+            kept,
+            vec![PathBuf::from("keep.rs"), PathBuf::from("src/main.rs")]
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn apply_excludes_with_no_patterns_keeps_everything_silently() {
+        let (_dir, root) = temp_repo();
+        let files = vec![PathBuf::from("a.txt"), PathBuf::from("b.log")];
+        let (kept, diagnostics) = super::apply_excludes(&root, files.clone(), &[]);
+        assert_eq!(kept, files);
+        assert!(diagnostics.is_empty());
     }
 }

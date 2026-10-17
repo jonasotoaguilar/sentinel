@@ -104,6 +104,16 @@ sentinel scan
 # Hermetic CI scan: ignores parent/global gitignore sources; repository-local rules only
 sentinel scan --ci
 
+# Exclude files by glob (repeatable; `.gitignore` semantics, repo-relative paths)
+sentinel scan --exclude '*.log' --exclude 'build/'
+
+# The same excludes live in `sentinel.toml` at the repository root
+# (`exclude = ["*.log"]`), with a user-level file at
+# `$XDG_CONFIG_HOME/sentinel/config.toml` — or `SENTINEL_CONFIG` to pin
+# an explicit file instead (e.g. in CI); precedence is CLI flag >
+# project config > user config > built-in default, and exclude lists
+# union across levels. A bad config warns once and never aborts.
+
 # Write SARIF 2.1.0 for CI ingestion
 sentinel scan --output sarif --report sentinel.sarif
 

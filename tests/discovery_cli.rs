@@ -83,10 +83,13 @@ fn commit_all(root: &Path, message: &str) {
     );
 }
 
-/// The scan binary with a hermetic git environment: no system/global config,
-/// no XDG global gitignore, and HOME pointing at the repository, so Local
-/// mode has no ambient sources beyond the repository itself. Callers may
-/// override cwd, HOME, or GIT_CONFIG_GLOBAL to plant an ambient ignore.
+/// The scan binary with a hermetic git and config environment: no
+/// system/global config, no XDG global gitignore, HOME pointing at the
+/// repository (so Local mode has no ambient sources beyond the repository
+/// itself), and the user-level sentinel config lookup pinned at the
+/// repository with `SENTINEL_CONFIG` removed (so ambient sentinel config
+/// cannot change what the test scans). Callers may override cwd, HOME, or
+/// GIT_CONFIG_GLOBAL to plant an ambient ignore.
 fn scan_bin(cwd: &Path) -> AssertCommand {
     let mut cmd = AssertCommand::cargo_bin("sentinel").unwrap();
     cmd.arg("scan")
@@ -94,7 +97,8 @@ fn scan_bin(cwd: &Path) -> AssertCommand {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("XDG_CONFIG_HOME", "")
+        .env("XDG_CONFIG_HOME", cwd)
+        .env_remove("SENTINEL_CONFIG")
         .env("HOME", cwd);
     cmd
 }
@@ -107,7 +111,8 @@ fn spawn_scan(cwd: &Path) -> std::process::Child {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("XDG_CONFIG_HOME", "")
+        .env("XDG_CONFIG_HOME", cwd)
+        .env_remove("SENTINEL_CONFIG")
         .env("HOME", cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
