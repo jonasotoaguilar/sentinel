@@ -22,7 +22,11 @@ Sentinel is a cross-platform Rust CLI (single crate, Edition 2024, stable toolch
 | Lint | `cargo fmt --all -- --check && cargo clippy --all-targets --all-features -- -D warnings` |
 | Tests | `cargo test --all-features` |
 
-> Bootstrap note: until `Cargo.toml` exists, these commands cannot run and the repo-local pre-commit hook (`.githooks/pre-commit`, activated via `core.hooksPath`) exits without checks. The hook activates automatically once the crate manifest lands.
+## Workflow
+
+Changes arrive as small pull requests that close the issue they deliver
+(`Closes #N`, `Fixes #N`, or `Resolves #N`). A feature's planning document
+lives in `odd/tasks/` in the working checkout and is not committed.
 
 ## Pull request
 

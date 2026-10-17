@@ -4,7 +4,6 @@
 
 /// Severity assigned by a rule (ARCHITECTURE findings model).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[allow(dead_code)] // Low is reserved for future rules.
 pub enum Severity {
     Low,
     Medium,
