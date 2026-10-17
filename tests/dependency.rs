@@ -700,3 +700,37 @@ fn osv_production_policy_refuses_plain_http_without_any_request() {
         "refused before any byte is sent"
     );
 }
+
+#[test]
+fn osv_batch_chunks_at_a_thousand_queries() {
+    let per = sentinel::ScanBudgets::production().max_pins_per_request;
+    assert_eq!(per, 1_000);
+    let queries = |n: usize| -> Vec<Query> {
+        (0..n)
+            .map(|i| Query {
+                eco: "npm".into(),
+                name: format!("pkg-{i}"),
+                ver: "1.0.0".into(),
+            })
+            .collect()
+    };
+    let (batch, vuln, posts) = osv_stub(OsvRespond::BatchOk);
+    osv_client(&batch, &vuln)
+        .query_all(&queries(1_000))
+        .unwrap();
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        1,
+        "exactly 1 000 queries is one request"
+    );
+    let (batch, vuln, posts) = osv_stub(OsvRespond::BatchOk);
+    let (results, _) = osv_client(&batch, &vuln)
+        .query_all(&queries(1_001))
+        .unwrap();
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        2,
+        "1 001 queries is two requests"
+    );
+    assert_eq!(results.len(), 1_001, "shape stays index-aligned");
+}

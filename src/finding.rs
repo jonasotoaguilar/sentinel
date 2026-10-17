@@ -214,4 +214,77 @@ impl Diagnostic {
             message: sanitize(msg),
         }
     }
+    /// The file budget was exceeded; only the first `kept` files were
+    /// scanned and `omitted` files were left out.
+    pub fn scan_files_truncated(kept: usize, omitted: usize) -> Self {
+        Self {
+            code: "scan-files-truncated",
+            path: String::new(),
+            rule: String::new(),
+            message: format!("file budget exceeded: scanned {kept} files, {omitted} files omitted"),
+        }
+    }
+    /// The scanned-content budget was exceeded; leading files fitting within
+    /// `kept_bytes` were scanned and `omitted_files` files carrying
+    /// `omitted_bytes` bytes were left out.
+    pub fn scan_bytes_truncated(kept_bytes: u64, omitted_bytes: u64, omitted_files: usize) -> Self {
+        Self {
+            code: "scan-bytes-truncated",
+            path: String::new(),
+            rule: String::new(),
+            message: format!(
+                "byte budget exceeded: scanned {kept_bytes} bytes, {omitted_bytes} bytes across {omitted_files} files omitted"
+            ),
+        }
+    }
+    /// The findings budget was exceeded; only the first `kept` findings
+    /// were reported and `omitted` findings were left out.
+    pub fn scan_findings_truncated(kept: usize, omitted: usize) -> Self {
+        Self {
+            code: "scan-findings-truncated",
+            path: String::new(),
+            rule: String::new(),
+            message: format!(
+                "finding budget exceeded: reported {kept} findings, {omitted} findings omitted"
+            ),
+        }
+    }
+}
+
+/// Total scan budgets (S7). The production values were decided in L10, and
+/// the reasoning travels with them so a reader never has to guess: a scan
+/// that has read a gibibyte of source has outlived any report a human will
+/// read; a ten-thousand-finding report is not a report; a hundred thousand
+/// files bounds the walk before memory follows; and a thousand queries per
+/// request keeps one request small enough that a failure loses little and
+/// re-chunking is cheap. Every breach degrades through [`Diagnostic`] and
+/// never changes the exit-code contract. Tests construct this struct with
+/// tiny limits instead of building hundred-thousand-file trees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanBudgets {
+    /// Maximum files scanned per run; the rest is left out with one
+    /// `scan-files-truncated` diagnostic.
+    pub max_files: usize,
+    /// Maximum scanned content bytes per run; the rest is left out with one
+    /// `scan-bytes-truncated` diagnostic.
+    pub max_scanned_bytes: u64,
+    /// Maximum findings reported per run; the rest is left out with one
+    /// `scan-findings-truncated` diagnostic.
+    pub max_findings: usize,
+    /// Maximum OSV queries per batch request; more pins are sent as
+    /// additional requests, never left out.
+    pub max_pins_per_request: usize,
+}
+
+impl ScanBudgets {
+    /// Production budgets: 100 000 files, 1 GiB of scanned content,
+    /// 10 000 findings, 1 000 pins per batch request.
+    pub fn production() -> Self {
+        Self {
+            max_files: 100_000,
+            max_scanned_bytes: 1024 * 1024 * 1024,
+            max_findings: 10_000,
+            max_pins_per_request: 1_000,
+        }
+    }
 }
