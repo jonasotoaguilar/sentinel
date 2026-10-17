@@ -298,3 +298,101 @@ fn seeded_reports_are_byte_identical_across_runs() {
     );
     assert_eq!(first.stderr, second.stderr);
 }
+
+#[test]
+fn advisory_id_and_summary_are_redacted_on_every_surface() {
+    // Why: the advisory id and summary are content-derived display fields.
+    const RAW_ID: &str = "AKIASYNTHETICKEY1234";
+    const RAW_SECRET: &str = "sk-synthetic-1234567890";
+    assert!(
+        sentinel::osv::is_valid_id(RAW_ID),
+        "seeded id must pass validation"
+    );
+    let (_dir, root) = temp_repo();
+    std::fs::write(root.join("requirements.txt"), b"flask==2.3.3\n").unwrap();
+    git(
+        &root,
+        [
+            OsStr::new("add"),
+            OsStr::new("--"),
+            OsStr::new("requirements.txt"),
+        ],
+    );
+    let xdg = TempDir::new().unwrap();
+    let advisory = serde_json::json!([{
+        "id": RAW_ID,
+        "summary": format!("exposes {RAW_SECRET} in summary"),
+        "severity": [{"type": "CVSS_V3", "score": "9.8"}]
+    }]);
+    seed_cache(
+        xdg.path(),
+        "PyPI",
+        "flask",
+        "2%2E3%2E3",
+        &serde_json::to_vec(&advisory).unwrap(),
+    );
+    let terminal = scan_with(xdg.path(), &root, &["--offline"]);
+    assert_eq!(terminal.status.code(), Some(1), "the finding still reports");
+    let terminal_blob = text_of(&terminal.stdout) + &text_of(&terminal.stderr);
+    assert!(
+        terminal_blob.contains("requirements.txt:1:1:"),
+        "finding present: {terminal_blob}"
+    );
+    assert!(
+        !terminal_blob.contains(RAW_ID),
+        "raw advisory id leaked on terminal: {terminal_blob}"
+    );
+    assert!(
+        !terminal_blob.contains(RAW_SECRET),
+        "raw summary secret leaked on terminal: {terminal_blob}"
+    );
+    assert!(
+        terminal_blob.contains("[REDACTED]"),
+        "redacted marker present: {terminal_blob}"
+    );
+    let json = scan_with(xdg.path(), &root, &["--offline", "--output", "json"]);
+    assert_eq!(json.status.code(), Some(1), "the finding still reports");
+    let json_blob = text_of(&json.stdout) + &text_of(&json.stderr);
+    assert!(json_blob.contains("OSV-"), "finding present: {json_blob}");
+    assert!(
+        !json_blob.contains(RAW_ID),
+        "raw advisory id leaked in json: {json_blob}"
+    );
+    assert!(
+        !json_blob.contains(RAW_SECRET),
+        "raw summary secret leaked in json: {json_blob}"
+    );
+    let sarif = scan_with(xdg.path(), &root, &["--offline", "--output", "sarif"]);
+    assert_eq!(sarif.status.code(), Some(1), "the finding still reports");
+    let sarif_blob = text_of(&sarif.stdout) + &text_of(&sarif.stderr);
+    assert!(sarif_blob.contains("OSV-"), "finding present: {sarif_blob}");
+    assert!(
+        !sarif_blob.contains(RAW_ID),
+        "raw advisory id leaked in sarif: {sarif_blob}"
+    );
+    assert!(
+        !sarif_blob.contains(RAW_SECRET),
+        "raw summary secret leaked in sarif: {sarif_blob}"
+    );
+    serde_json::from_slice::<serde_json::Value>(&sarif.stdout).unwrap();
+    let report = scan_with(
+        xdg.path(),
+        &root,
+        &["--offline", "--output", "json", "--report", "out.json"],
+    );
+    assert_eq!(report.status.code(), Some(1), "the finding still reports");
+    assert!(report.stdout.is_empty(), "stdout stays empty with --report");
+    let report_blob = text_of(&std::fs::read(root.join("out.json")).unwrap());
+    assert!(
+        report_blob.contains("OSV-"),
+        "finding present: {report_blob}"
+    );
+    assert!(
+        !report_blob.contains(RAW_ID),
+        "raw advisory id leaked in report file: {report_blob}"
+    );
+    assert!(
+        !report_blob.contains(RAW_SECRET),
+        "raw summary secret leaked in report file: {report_blob}"
+    );
+}
