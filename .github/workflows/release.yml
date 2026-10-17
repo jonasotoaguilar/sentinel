@@ -172,6 +172,12 @@ jobs:
         run: cargo install cargo-cyclonedx --version 0.5.9 --locked
 
       - name: Generate SBOM
+        env:
+          # This step once failed with exit code 1 and printed no message at
+          # all, which cost a dispatch to learn nothing. The environment now
+          # asks for the detail up front: a failure that explains itself is
+          # worth more than one that only reports that it happened.
+          RUST_BACKTRACE: "1"
         # `cargo cyclonedx` writes bom.json next to Cargo.toml; rename it
         # into dist/ under the same tag scheme as the other release assets.
         # JSON (not XML) because actions/attest-sbom requires a
@@ -179,7 +185,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo cyclonedx --all --format json
+          cargo cyclonedx -vv --all --format json
           test -f bom.json
           mv bom.json "dist/sentinel-${TAG}-sbom.json"
           ls -la dist/
