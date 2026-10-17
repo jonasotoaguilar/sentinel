@@ -96,6 +96,17 @@ impl Diagnostic {
             message,
         }
     }
+
+    /// A file could not be fully parsed, so only the regions the parser
+    /// recovered were scanned; the scan continues with reduced coverage.
+    pub fn rule_fallback(path: &str, message: &str) -> Self {
+        Self {
+            code: "rule-fallback",
+            path: path.to_string(),
+            rule: String::new(),
+            message: sanitize(message),
+        }
+    }
     pub fn version_unpinned_skipped(path: &str, line: u64) -> Self {
         Self {
             code: "version-unpinned-skipped",

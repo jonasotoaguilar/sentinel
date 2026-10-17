@@ -56,7 +56,7 @@ graph TD
 
     subgraph "Detector Engines (Rayon, parallel)"
         E1["Secrets engine (regex rules)"]
-        E2["Rules engine (Tree-sitter JS/TS + Python, regex fallback)"]
+        E2["Rules engine (Tree-sitter JS/TS + Python)"]
         E3["Dependency engine (manifest resolver)"]
     end
 
@@ -204,7 +204,7 @@ classDiagram
 All engines share one contract: file or manifest input → zero or more **raw findings** with engine-local rule IDs and severity, with secret values **redacted at this boundary** (raw values never leave an engine). Engines are independent — one engine failing does not affect the others.
 
 - **Secrets engine (regex)**: curated regex rule set for API keys, tokens, and credentials over file bytes; emits redacted evidence only.
-- **Rules engine (Tree-sitter)**: AST rules for JavaScript/TypeScript and Python; per-file parse failure degrades to regex fallback for that file (warn at debug level), never a scan abort. Detects vulnerable patterns the regex layer cannot express (e.g., weak crypto API misuse within scope of MVP rule set).
+- **Rules engine (Tree-sitter)**: AST rules for JavaScript/TypeScript and Python; an unparseable file is skipped with one `rule-fallback` diagnostic, never a scan abort. Detects vulnerable patterns the regex layer cannot express (e.g., weak crypto API misuse within scope of MVP rule set).
 - **Dependency engine**: resolves declared dependencies from supported manifests (npm family for JS/TS, PyPI for Python) into canonical `(ecosystem, package, version)` triples, then queries the OSV adapter. Offline or degraded → warns and skips dependency findings; never fails the scan.
 
 - **Technology**: Rust, rayon, regex, tree-sitter (JS/TS/Python grammars), serde/toml for manifests.
@@ -341,7 +341,7 @@ All engines share one contract: file or manifest input → zero or more **raw fi
 | OSV client: batch query + pagination + detail fetches, TTL 24 h cache, offline degrade (warn/skip, never fail) | Batch minimizes requests; pagination is a documented research constraint; TTL bounds staleness; offline is a PRD product rule | Cacheless online-only (violates offline rule); full local advisory DB (violates no-DB); infinite cache (unbounded staleness) — ADR-0002 |
 | Explain adapter: isolated, opt-in, sync HTTP, redacted context, untrusted output, never severity/blocking, off in CI/offline | PRD hard rule enforced by construction; redaction at engine boundary makes raw secrets structurally unreachable | LLM-in-the-loop severity (explicitly rejected by PRD); no explainer (PRD lists it in scope) — ADR-0003 |
 | Errors: thiserror for domain errors, anyhow for app composition; tracing to stderr | Domain errors are typed and stable (rule/engine errors); app layer composes without ceremony; stdout reserved for findings | Custom error enum everywhere (boilerplate); panics on failure (no exit-code contract) |
-| Tree-sitter with per-file regex fallback | Grammar coverage gaps are a known risk (PRD risk register); fallback keeps scans whole and findings deterministic per rule set | Pure AST-only (gaps → silent misses); regex-only (loses AST value) |
+| Tree-sitter with a skip-and-warn policy for unparseable files | Grammar coverage gaps are a known risk (PRD risk register); skipping keeps scans sound and findings deterministic per rule set | Pure AST-only (gaps → silent misses); regex-only (loses AST value) |
 | Out-of-bound adapters behind interfaces with two real adapters (HTTP + local stub server) | Module-design rule: seams only with real adapters; tests exercise the public interface | Mocking own internals (smell); no seam (network-bound tests) |
 
 ---
@@ -354,7 +354,7 @@ All engines share one contract: file or manifest input → zero or more **raw fi
 | OSV API unreachable (online mode) | Dependency findings unavailable; possible hang without timeouts | Per-request timeout ≤ 10 s; retry transient failures (conn reset, 429, 5xx) with bounded exponential backoff + jitter; final failure → stale cache + warn, or warn + skip dependency engine; scan completes with secrets/rules findings; validated by stub-server tests simulating failure |
 | OSV API shape/behavior change (pagination semantics, payload drift) | Corrupt or partial advisory data; cache poisoning | Adapter validates response shape at the trust boundary; schema-versioned cache; contract tests against the pinned API reference; cache entries failing validation are treated as misses |
 | Cache corruption / partial writes / schema drift | Wrong or stale advisory data | Atomic write (temp + rename) prevents partial entries; per-entry validation on read; schema-versioned cache subdir; corrupt entry → warn + refetch (validated by corruption fixture tests) |
-| Tree-sitter parse failure on a real-world file | Missing AST findings for that file | Per-file regex fallback for the same rule class + debug-level warning; engine continues; validated by fixture files that intentionally fail parsing |
+| Tree-sitter parse failure on a real-world file | No findings for that file; the gap is disclosed | Skip the file with one `rule-fallback` diagnostic; engine continues; validated by fixture files that intentionally fail parsing |
 | Pathological inputs (huge single file, huge repo) | Time/memory blowup | Max-file-size guard (skip + warn); bounded traversal; sub-minute NFR tested on a generated corpus; peak-RSS target checked in CI on the fixture corpus |
 | `--explain` endpoint failure/timeout | Missing advisory text | Single attempt, no retries, bounded timeout; warn + continue; findings/severity/exit code byte-identical to the non-explain scan (validated by differential tests) |
 | Ambient ignore config leaks into CI results | Non-hermetic, machine-dependent scans | Hermetic CI mode disables parent/global/exclude ignore sources; validated by tests planting ignore files above the repo root and asserting no effect |

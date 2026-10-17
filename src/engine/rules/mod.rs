@@ -90,46 +90,88 @@ impl RulesEngine {
 
     /// Scans one file; unsupported extensions and languages without rules
     /// return no candidates without any parse attempt. Candidates carry
-    /// only redacted text and the pre-redaction digest.
+    /// only redacted text and the pre-redaction digest. This is a thin
+    /// wrapper: parse-failure diagnostics are discarded, use
+    /// [`RulesEngine::scan_with_diagnostics`] when they matter.
+    #[cfg(test)]
     pub fn scan(&self, path: &str, bytes: &[u8]) -> Vec<Candidate> {
+        self.scan_with_diagnostics(path, bytes).0
+    }
+
+    /// Scans one file with its diagnostics. A file the grammar cannot
+    /// fully parse is skipped and said so: no finding is reported for it
+    /// and exactly one `rule-fallback` diagnostic names the path. The
+    /// engine declines to guess what the text was meant to be, because
+    /// every recovery from a parse failure is a guess about intent and
+    /// two such guesses have been shown to invent findings.
+    pub fn scan_with_diagnostics(
+        &self,
+        path: &str,
+        bytes: &[u8],
+    ) -> (Vec<Candidate>, Vec<Diagnostic>) {
         let Some(language) = lang::detect(path) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         if !self
             .rules
             .iter()
             .any(|rule| rule.languages.contains(&language))
         {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let mut parser = Parser::new();
         if parser.set_language(grammar(language)).is_err() {
             // Grammars are compiled in and validated at construction;
             // stay silent rather than invent a finding.
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let Some(tree) = parser.parse(bytes, None) else {
-            return Vec::new();
+            return (
+                Vec::new(),
+                vec![Diagnostic::rule_fallback(
+                    path,
+                    "the file did not fully parse; no rule was applied to it",
+                )],
+            );
         };
         let root = tree.root_node();
+        if root.has_error() {
+            return (
+                Vec::new(),
+                vec![Diagnostic::rule_fallback(
+                    path,
+                    "the file did not fully parse; no rule was applied to it",
+                )],
+            );
+        }
         let mut candidates = Vec::new();
         for rule in &self.rules {
             if !rule.languages.contains(&language) {
                 continue;
             }
             for hit in (rule.matches)(bytes, root) {
-                candidates.push(self.candidate(rule, bytes, hit));
+                candidates.push(self.candidate(rule.id, rule.severity, rule.message, bytes, hit));
             }
         }
-        candidates
+        (candidates, Vec::new())
     }
 
-    fn candidate(&self, rule: &RuleDef, bytes: &[u8], hit: Hit) -> Candidate {
+    /// Builds one candidate through the shared boundary: the matched
+    /// line redacted with the secrets table, the digest over the
+    /// pre-redaction bytes.
+    fn candidate(
+        &self,
+        id: &'static str,
+        severity: Severity,
+        message: &'static str,
+        bytes: &[u8],
+        hit: Hit,
+    ) -> Candidate {
         let (line, column) = locate(bytes, hit.start);
         Candidate {
-            rule_id: rule.id.to_string(),
-            severity: rule.severity,
-            message: rule.message.to_string(),
+            rule_id: id.to_string(),
+            severity,
+            message: message.to_string(),
             line,
             column,
             snippet: self.redactor.redact(&line_text(bytes, hit.start)),
@@ -212,6 +254,144 @@ mod tests {
         let found = engine.scan("a.js", b"const h = 1;");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].rule_id, "RULE-synthetic");
+    }
+
+    #[test]
+    fn degraded_recovery_does_not_promote_the_next_line_of_a_broken_delimiter() {
+        let engine = RulesEngine::new();
+        let cases = [
+            (
+                "a.py",
+                "s = \"subprocess.run(cmd, shell=True)\n",
+                "s = \"subprocess.run(cmd, shell=True)\"\n",
+            ),
+            (
+                "a.py",
+                "s = \"hashlib.md5(data)\n",
+                "s = \"hashlib.md5(data)\"\n",
+            ),
+            (
+                "a.py",
+                "s = \"pickle.loads(payload)\n",
+                "s = \"pickle.loads(payload)\"\n",
+            ),
+            (
+                "a.py",
+                "s = \"yaml.load(data)\n",
+                "s = \"yaml.load(data)\"\n",
+            ),
+            (
+                "a.js",
+                "const s = \"hello\ncrypto.createHash('md5');\n",
+                "const s = \"hello crypto.createHash('md5');\";\n",
+            ),
+            (
+                "a.ts",
+                "const s = \"\neval(userInput);\n",
+                "const s = \"eval(userInput);\";\n",
+            ),
+            (
+                "a.tsx",
+                "const s = \"\nchild_process.exec(`ls ${dir}`);\n",
+                "const s = \"child_process.exec(`ls ${dir}`);\";\n",
+            ),
+            (
+                "a.js",
+                "/* hello\ncrypto.createHash('md5');\n",
+                "/* hello\ncrypto.createHash('md5');\n*/\n",
+            ),
+        ];
+        for (path, degraded, twin) in cases {
+            let (found, diagnostics) = engine.scan_with_diagnostics(path, degraded.as_bytes());
+            let (twin_found, twin_diagnostics) =
+                engine.scan_with_diagnostics(path, twin.as_bytes());
+            assert!(
+                twin_diagnostics.is_empty() && twin_found.is_empty(),
+                "{path} {twin:?}"
+            );
+            assert!(
+                found.is_empty(),
+                "{path} invented {found:?} from {degraded:?}"
+            );
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, "rule-fallback");
+            assert_eq!(diagnostics[0].path, path);
+        }
+    }
+
+    #[test]
+    fn degraded_files_never_report_what_the_parseable_twin_would_not() {
+        let engine = RulesEngine::new();
+        let cases = [
+            ("a.js", "other.createHash('md5');\nfunction broken( {\n"),
+            ("a.js", "crypto.CREATEHASH('md5');\nfunction broken( {\n"),
+            ("a.js", "// crypto.createHash('md5');\nfunction broken( {\n"),
+            (
+                "a.js",
+                "const s = \"crypto.createHash('md5')\";\nfunction broken( {\n",
+            ),
+            ("a.js", "obj.eval(userInput);\nfunction broken( {\n"),
+            (
+                "a.js",
+                "child_process.exec(cmd, {x: a + b});\nfunction broken( {\n",
+            ),
+            (
+                "a.js",
+                "child_process.exec(cmd /* + x */);\nfunction broken( {\n",
+            ),
+            (
+                "a.js",
+                "eval(\"print(1)\");\ncrypto.createHash(\"sha256\");\nfunction broken( {\n",
+            ),
+            ("a.py", "foo.hashlib.md5(data)\ndef broken( :\n"),
+            (
+                "a.py",
+                "subprocess.run(cmd, shell=Trueish)\ndef broken( :\n",
+            ),
+            (
+                "a.py",
+                "x = \"subprocess.run(cmd, shell=True)\"\ndef broken( :\n",
+            ),
+            (
+                "a.py",
+                "yaml.load(\n    data,\n    Loader=yaml.SafeLoader)\ndef broken( :\n",
+            ),
+        ];
+        let mut invented = Vec::new();
+        for (path, source) in cases {
+            let (found, diagnostics) = engine.scan_with_diagnostics(path, source.as_bytes());
+            if !found.is_empty() {
+                invented.push((path, source, found));
+            }
+            assert_eq!(
+                diagnostics.len(),
+                1,
+                "path {path} source {source:?}: expected exactly one diagnostic"
+            );
+            assert_eq!(diagnostics[0].code, "rule-fallback");
+        }
+        assert!(
+            invented.is_empty(),
+            "degraded scan invented findings: {invented:?}"
+        );
+    }
+
+    #[test]
+    fn parseable_files_emit_no_fallback_diagnostic() {
+        let (found, diagnostics) = RulesEngine::new()
+            .scan_with_diagnostics("a.js", b"const h = crypto.createHash('md5');\n");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].rule_id, "RULE-weak-hash");
+        assert!(diagnostics.is_empty(), "got {diagnostics:?}");
+    }
+
+    #[test]
+    fn degraded_file_without_a_match_warns_once_and_reports_nothing() {
+        let (found, diagnostics) =
+            RulesEngine::new().scan_with_diagnostics("a.js", b"const h = 1;\nfunction broken( {\n");
+        assert!(found.is_empty(), "got {found:?}");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "rule-fallback");
     }
 
     #[test]
