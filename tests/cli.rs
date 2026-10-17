@@ -187,12 +187,7 @@ fn running_as_root() -> bool {
 #[test]
 fn unsupported_arguments_and_missing_subcommand_write_stderr_only_and_exit_2() {
     let dir = TempDir::new().unwrap(); // not a repository: usage fails before discovery
-    for args in [
-        Vec::new(),
-        vec!["--explain"],
-        vec!["scan", "--explain"],
-        vec!["scan", "file.txt"],
-    ] {
+    for args in [Vec::new(), vec!["scan", "file.txt"]] {
         let (code, stdout, stderr) = scan_seam_in(&args, dir.path());
         assert_eq!(code, ExitCode::from(2), "args {args:?}");
         assert!(stdout.is_empty(), "args {args:?}: stdout must stay empty");
@@ -204,16 +199,16 @@ fn unsupported_arguments_and_missing_subcommand_write_stderr_only_and_exit_2() {
 }
 
 #[test]
-fn binary_writes_usage_error_to_stderr_with_empty_stdout_and_exit_2() {
-    let dir = TempDir::new().unwrap();
-    let output = scan_bin(dir.path())
-        .arg("scan")
-        .arg("--explain")
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
-    assert!(text_of(&output.stderr).contains("unexpected argument"));
+fn binary_accepts_explain_and_degrades_to_skip_without_configuration() {
+    let (_dir, root) = temp_repo();
+    track_fixture(&root, "basic/env.example", "env.example");
+    let plain = scan_bin(&root).output().unwrap();
+    let explained = scan_bin(&root).arg("--explain").output().unwrap();
+    assert_eq!(explained.status.code(), Some(1));
+    assert_eq!(explained.status.code(), plain.status.code());
+    assert_eq!(explained.stdout, plain.stdout);
+    let stderr = text_of(&explained.stderr);
+    assert_eq!(stderr.matches("explain-skipped").count(), 1);
 }
 
 #[test]

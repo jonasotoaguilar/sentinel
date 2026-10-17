@@ -4,6 +4,7 @@
 //!
 //! `json` (PR1) and `sarif` (PR2) are pure sub-renderers at the same
 //! boundary; terminal rendering below stays byte-identical.
+use std::collections::BTreeMap;
 use std::io::Write;
 
 use crate::finding::{Diagnostic, Finding};
@@ -13,8 +14,13 @@ mod sarif;
 pub use json::render_json;
 pub use sarif::render_sarif;
 
-/// Renders the findings report; the only content ever written to stdout.
-pub fn render_findings(findings: &[Finding]) -> Vec<u8> {
+/// Renders the findings report with one advisory line per finding that has
+/// one. Findings without advisory text render exactly as [`render_findings`]
+/// does; advisory text is sanitized, single-line, and terminal-exclusive.
+pub fn render_findings_with_advisories(
+    findings: &[Finding],
+    advisories: &BTreeMap<String, String>,
+) -> Vec<u8> {
     let mut out = Vec::new();
     for finding in findings {
         let _ = writeln!(
@@ -29,8 +35,16 @@ pub fn render_findings(findings: &[Finding]) -> Vec<u8> {
         );
         let _ = writeln!(out, "  {}", finding.location.snippet);
         let _ = writeln!(out, "  evidence: {}", finding.evidence);
+        if let Some(text) = advisories.get(&finding.id) {
+            let _ = writeln!(out, "  advice: {}", crate::explain::sanitize_advisory(text));
+        }
     }
     out
+}
+
+/// Renders the findings report; the only content ever written to stdout.
+pub fn render_findings(findings: &[Finding]) -> Vec<u8> {
+    render_findings_with_advisories(findings, &BTreeMap::new())
 }
 
 /// Renders diagnostics to stderr, sorted by `(code, path, rule)`.
@@ -91,6 +105,27 @@ mod tests {
         ));
         assert!(text.contains("  [REDACTED]") && text.contains("  evidence: [REDACTED]"));
         assert!(!text.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn advisories_append_one_sanitized_line_per_finding() {
+        use std::collections::BTreeMap;
+        let findings = vec![finding("env.example", 2)];
+        let plain = render_findings(&findings);
+        assert_eq!(
+            render_findings_with_advisories(&findings, &BTreeMap::new()),
+            plain
+        );
+        let advisories = BTreeMap::from([
+            (findings[0].id.clone(), "ok advice".to_string()),
+            ("ghost".to_string(), "ignored".to_string()),
+        ]);
+        let text =
+            String::from_utf8(render_findings_with_advisories(&findings, &advisories)).unwrap();
+        assert!(text.starts_with(&String::from_utf8(plain).unwrap()));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "exactly one advisory line: {text:?}");
+        assert_eq!(lines[3], "  advice: ok advice");
     }
 
     #[test]

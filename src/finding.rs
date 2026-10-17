@@ -107,6 +107,16 @@ impl Diagnostic {
             message: sanitize(message),
         }
     }
+    /// `--explain` was requested but no explainer is configured; the scan
+    /// continues without advisory text and the exit code is unchanged.
+    pub fn explain_skipped(message: &str) -> Self {
+        Self {
+            code: "explain-skipped",
+            path: String::new(),
+            rule: String::new(),
+            message: sanitize(message),
+        }
+    }
     pub fn version_unpinned_skipped(path: &str, line: u64) -> Self {
         Self {
             code: "version-unpinned-skipped",
