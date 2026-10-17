@@ -71,6 +71,16 @@ struct Rule<'a> {
     id: &'a str,
 }
 
+/// A standard SARIF suppression: where the acceptance is persisted
+/// (`external` = a baseline file, not the source) and its review state.
+/// Present only on baseline-accepted results.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Suppression {
+    kind: &'static str,
+    status: &'static str,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SarifResult<'a> {
@@ -79,6 +89,8 @@ struct SarifResult<'a> {
     level: &'static str,
     message: Message<'a>,
     locations: Vec<Location>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suppressions: Option<Vec<Suppression>>,
 }
 
 #[derive(Serialize)]
@@ -121,6 +133,18 @@ fn level(severity: Severity) -> &'static str {
     }
 }
 
+/// Renders with the incompleteness signal and baseline acceptance:
+/// accepted findings (members of `accepted`) carry one external accepted
+/// suppression each; the field is absent otherwise, so a scan with no
+/// baseline is byte-identical to [`render_sarif_with_status`].
+pub fn render_sarif_with_status_and_accepted(
+    findings: &[Finding],
+    incomplete: bool,
+    accepted: &std::collections::BTreeSet<String>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    render_log(findings, incomplete, accepted)
+}
+
 /// Renders the SARIF 2.1.0 log bytes: compact (`serde_json::to_vec`) plus a
 /// trailing newline; errors are serialization failures only.
 pub fn render_sarif(findings: &[Finding]) -> Result<Vec<u8>, serde_json::Error> {
@@ -133,6 +157,18 @@ pub fn render_sarif(findings: &[Finding]) -> Result<Vec<u8>, serde_json::Error> 
 pub fn render_sarif_with_status(
     findings: &[Finding],
     incomplete: bool,
+) -> Result<Vec<u8>, serde_json::Error> {
+    render_log(findings, incomplete, &std::collections::BTreeSet::new())
+}
+
+/// The single log builder: `accepted` holds baseline-accepted finding keys
+/// (see [`crate::finding::Finding::baseline_key`]); an empty set leaves
+/// every result without `suppressions`, which is exactly the no-baseline
+/// shape, so the older entry points stay byte-identical by construction.
+fn render_log(
+    findings: &[Finding],
+    incomplete: bool,
+    accepted: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<u8>, serde_json::Error> {
     // Unique, lexicographically sorted rule-ID vector; each result's index is
     // its position in this vector via binary search (design).
@@ -168,6 +204,12 @@ pub fn render_sarif_with_status(
                         },
                     },
                 }],
+                suppressions: accepted.contains(&finding.baseline_key()).then(|| {
+                    vec![Suppression {
+                        kind: "external",
+                        status: "accepted",
+                    }]
+                }),
             }
         })
         .collect();
@@ -309,5 +351,69 @@ mod tests {
                 .unwrap();
             assert_eq!(uri, expected, "path {path}");
         }
+    }
+
+    #[test]
+    fn empty_accepted_set_renders_byte_identical_to_plain() {
+        use std::collections::BTreeSet;
+        let findings = vec![finding("a.txt", 1, Severity::High, "SECRET-x")];
+        assert_eq!(
+            render_sarif_with_status_and_accepted(&findings, false, &BTreeSet::new()).unwrap(),
+            render_sarif(&findings).unwrap(),
+            "no baseline means today's bytes exactly"
+        );
+        assert_eq!(
+            render_sarif_with_status_and_accepted(&findings, true, &BTreeSet::new()).unwrap(),
+            render_sarif_with_status(&findings, true).unwrap(),
+            "the incompleteness signal is unchanged without a baseline"
+        );
+    }
+
+    #[test]
+    fn accepted_findings_carry_an_external_accepted_suppression() {
+        use std::collections::BTreeSet;
+        let mut first = finding("a.txt", 1, Severity::High, "SECRET-x");
+        first.id = "secrets/SECRET-x/a.txt:1:1/aaaa".to_string();
+        let mut second = finding("b.txt", 1, Severity::High, "SECRET-x");
+        second.id = "secrets/SECRET-x/b.txt:1:1/bbbb".to_string();
+        let findings = vec![first.clone(), second.clone()];
+        let accepted = BTreeSet::from([first.baseline_key()]);
+        let value =
+            parse(&render_sarif_with_status_and_accepted(&findings, false, &accepted).unwrap());
+        let results = value["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(
+            results[0]["suppressions"],
+            serde_json::json!([{"kind": "external", "status": "accepted"}]),
+            "accepted finding uses the standard SARIF suppression"
+        );
+        assert!(
+            results[1].get("suppressions").is_none(),
+            "unaccepted finding carries no suppression: {}",
+            results[1]
+        );
+    }
+
+    #[test]
+    fn accepted_sarif_stays_valid_against_the_pinned_schema() {
+        // The suppression is standard SARIF, so the schema the
+        // machine-reporting tests pin must still accept the log.
+        use std::collections::BTreeSet;
+        let mut only = finding("a.txt", 1, Severity::High, "SECRET-x");
+        only.id = "secrets/SECRET-x/a.txt:1:1/aaaa".to_string();
+        let findings = vec![only.clone()];
+        let accepted = BTreeSet::from([only.baseline_key()]);
+        let bytes = render_sarif_with_status_and_accepted(&findings, false, &accepted).unwrap();
+        let schema: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/sarif-2.1.0.schema.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        jsonschema::draft7::new(&schema)
+            .expect("pinned schema must compile")
+            .validate(&serde_json::from_slice::<serde_json::Value>(&bytes).unwrap())
+            .expect("accepted SARIF must stay schema-valid");
     }
 }

@@ -26,6 +26,8 @@ struct Tool<'a> {
 }
 
 /// A single finding; field order is the wire order, severity lowercase.
+/// `accepted` is present only for baseline-accepted findings, so reports
+/// without a baseline carry no new field at all.
 #[derive(Serialize)]
 struct FindingReport<'a> {
     id: &'a str,
@@ -36,6 +38,8 @@ struct FindingReport<'a> {
     location: LocationReport<'a>,
     message: &'a str,
     evidence: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accepted: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -48,6 +52,14 @@ struct LocationReport<'a> {
 
 impl<'a> From<&'a Finding> for FindingReport<'a> {
     fn from(finding: &'a Finding) -> Self {
+        Self::for_finding(finding, None)
+    }
+}
+
+impl<'a> FindingReport<'a> {
+    /// Builds the wire form, marking acceptance only when requested: `None`
+    /// serializes to no field at all, `Some(true)` to `"accepted": true`.
+    fn for_finding(finding: &'a Finding, accepted: Option<bool>) -> Self {
         Self {
             id: &finding.id,
             engine: &finding.engine,
@@ -61,6 +73,7 @@ impl<'a> From<&'a Finding> for FindingReport<'a> {
             },
             message: &finding.message,
             evidence: &finding.evidence,
+            accepted,
         }
     }
 }
@@ -82,6 +95,37 @@ where
 /// trailing newline; errors are serialization failures only.
 pub fn render_json(findings: &[Finding]) -> Result<Vec<u8>, serde_json::Error> {
     render_json_with_status(findings, false)
+}
+
+/// Renders with the incompleteness signal and baseline acceptance:
+/// accepted findings (members of `accepted`) carry `"accepted": true`;
+/// the flag is absent otherwise, so a scan with no baseline is
+/// byte-identical to [`render_json_with_status`] by construction.
+pub fn render_json_with_status_and_accepted(
+    findings: &[Finding],
+    incomplete: bool,
+    accepted: &std::collections::BTreeSet<String>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let report = Report {
+        schema_version: "1.0.0",
+        tool: Tool {
+            name: "sentinel",
+            version: env!("CARGO_PKG_VERSION"),
+        },
+        findings: findings
+            .iter()
+            .map(|finding| {
+                FindingReport::for_finding(
+                    finding,
+                    accepted.contains(&finding.baseline_key()).then_some(true),
+                )
+            })
+            .collect(),
+        incomplete: incomplete.then_some(true),
+    };
+    let mut bytes = serde_json::to_vec(&report)?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 /// Renders with the incompleteness signal: `incomplete` is absent when
@@ -179,5 +223,51 @@ mod tests {
         assert!(text.contains("quote \\\" and newline\\n"));
         assert!(!text.contains(AWS_KEY) && !text.contains(TOKEN));
         serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+    }
+
+    #[test]
+    fn empty_accepted_set_renders_byte_identical_to_plain() {
+        use std::collections::BTreeSet;
+        let findings = vec![finding("a.txt", 1, Severity::High, "msg")];
+        assert_eq!(
+            render_json_with_status_and_accepted(&findings, false, &BTreeSet::new()).unwrap(),
+            render_json(&findings).unwrap(),
+            "no baseline means today's bytes exactly"
+        );
+        assert_eq!(
+            render_json_with_status_and_accepted(&findings, true, &BTreeSet::new()).unwrap(),
+            render_json_with_status(&findings, true).unwrap(),
+            "the incompleteness signal is unchanged without a baseline"
+        );
+    }
+
+    #[test]
+    fn accepted_findings_carry_an_accepted_flag_absent_otherwise() {
+        use std::collections::BTreeSet;
+        let mut first = finding("a.txt", 0, Severity::High, "msg");
+        first.id = "secrets/SECRET-aws-access-key/a.txt:0:1/aaaa".to_string();
+        let mut second = finding("b.txt", 1, Severity::High, "msg");
+        second.id = "secrets/SECRET-aws-access-key/b.txt:1:1/bbbb".to_string();
+        let findings = vec![first.clone(), second.clone()];
+        let accepted = BTreeSet::from([first.baseline_key()]);
+        let value: serde_json::Value = serde_json::from_slice(
+            &render_json_with_status_and_accepted(&findings, false, &accepted).unwrap(),
+        )
+        .unwrap();
+        let got = value["findings"].as_array().unwrap();
+        assert_eq!(got[0]["accepted"], true, "accepted finding is marked");
+        assert!(
+            got[1].get("accepted").is_none(),
+            "unaccepted finding carries no flag: {}",
+            got[1]
+        );
+        assert_eq!(value["schema_version"], "1.0.0", "envelope unchanged");
+        // The flag composes with the incompleteness signal.
+        let degraded: serde_json::Value = serde_json::from_slice(
+            &render_json_with_status_and_accepted(&findings, true, &accepted).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(degraded["incomplete"], true);
+        assert_eq!(degraded["findings"][0]["accepted"], true);
     }
 }

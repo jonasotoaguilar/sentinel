@@ -178,14 +178,14 @@ classDiagram
 
 **Exit-code contract** (part of the CLI surface; exact values confirmed during implementation planning):
 - `0` — scan completed, no findings that block.
-- `1` — scan completed, findings present (blocking policy applied, e.g., CI gate).
+- `1` — scan completed, unaccepted findings at or above the `--fail-under` threshold (blocking policy applied, e.g., CI gate). Baseline-accepted findings are excluded from this decision: they still render — marked per format — but accepting a finding quiets the build, otherwise acceptance would be pointless.
 - `2` — operational failure (git unavailable, I/O error, unrecoverable internal error).
 - The `--explain` adapter can never influence this contract — a scan with and without `--explain` exits identically given the same findings.
 
 ### Scan Orchestrator
 
 - **Technology**: Rust, plain synchronous composition.
-- **Responsibility**: Run the fixed pipeline — discovery → parallel engines → normalization → dedupe → deterministic order → renderers — and coordinate mode flags (offline, CI, explain).
+- **Responsibility**: Run the fixed pipeline — discovery → parallel engines → normalization → dedupe → deterministic order → baseline acceptance → renderers — and coordinate mode flags (offline, CI, explain), the exit-policy threshold, and the `--baseline` / `--update-baseline` file.
 - **Scaling**: CPU parallelism is delegated to Rayon inside the engine stage only; the orchestrator itself is single-threaded and deterministic.
 - **Dependencies**: Discovery, engines, normalizer, renderers, explain adapter.
 - **Failure modes**: Any stage failing hard aborts the scan with exit code 2; engine-local failures (parse errors, network degradation) are contained per-engine and never abort the whole scan (see Failure Modes).
