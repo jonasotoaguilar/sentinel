@@ -3,6 +3,7 @@
 
 pub mod javascript;
 pub mod lang;
+pub mod python;
 
 use std::sync::OnceLock;
 
@@ -40,6 +41,9 @@ const RULE_DEFS: &[RuleDef] = &[
     javascript::WEAK_HASH_DEF,
     javascript::DYNAMIC_CODE_DEF,
     javascript::SHELL_INJECTION_DEF,
+    python::WEAK_HASH_PY_DEF,
+    python::SHELL_INJECTION_PY_DEF,
+    python::UNSAFE_DESERIALIZATION_PY_DEF,
 ];
 
 /// The code-rules engine over a compiled rule table.
