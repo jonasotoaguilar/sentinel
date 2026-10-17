@@ -16,6 +16,7 @@ mod render;
 mod test_util;
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -33,8 +34,9 @@ pub use finding::ScanBudgets;
 
 /// Runs the requested command and returns the process exit code. Usage errors
 /// and operational failures map to exit 2; a completed scan exits 1 when its
-/// findings reach the `--fail-under` policy (by default, any finding) and 0
-/// otherwise. The report (or the completion script) is the
+/// unaccepted findings reach the `--fail-under` policy (by default, any
+/// finding) and 0 otherwise — accepted baseline entries never fail the
+/// build. The report (or the completion script) is the
 /// only stdout content; diagnostics go to stderr.
 pub fn run(
     args: &[String],
@@ -276,6 +278,8 @@ pub(crate) fn run_with_dep_client(
         explain,
         exclude,
         fail_under,
+        baseline,
+        update_baseline,
         path,
     } = cli.command
     else {
@@ -313,15 +317,19 @@ pub(crate) fn run_with_dep_client(
         files,
         diagnostics: discovery_diagnostics,
     } = discovered;
-    // Layered configuration (T1/T2): CLI values, then the project
+    // Layered configuration (T1/T2/T4): CLI values, then the project
     // `sentinel.toml`, then the user-level file at the caller-chosen path —
     // `None` skips it, which keeps hermetic tests immune to the developer's
-    // home directory. Excludes union across levels while `fail_under`
-    // overrides; the same merged excludes apply in both modes, so `--ci`
-    // stays hermetic.
+    // home directory. Excludes union across levels while `fail_under` and
+    // `baseline` override; the same merged excludes apply in both modes, so
+    // `--ci` stays hermetic.
     let (configured, config_diagnostics) =
-        config::resolve_full_with(&root, &exclude, fail_under, user_config);
+        config::resolve_full_with(&root, &exclude, fail_under, baseline, user_config, cwd);
     let configured_excludes = configured.excludes;
+    // The winning baseline path (T4), if any level named one: CLI over
+    // project over user, resolved per level (project against the target
+    // root, CLI and user against the invoking directory).
+    let baseline_path = configured.baseline;
     // Exit policy (S3): the winning `fail_under`, or the default (any
     // finding fails) when no level set it.
     let policy = configured.fail_under.unwrap_or_default();
@@ -474,6 +482,52 @@ pub(crate) fn run_with_dep_client(
     let (findings, findings_diag) = apply_findings_budget(findings, &budgets);
     diagnostics.extend(findings_diag);
 
+    // Baseline of accepted findings (S5): keys are location-independent
+    // (`Finding::baseline_key`), so moves and renames stay accepted while
+    // changed content reports fresh. Accepted findings still render —
+    // marked per format — but never fail the build; stale entries warn.
+    // `--update-baseline` rewrites the file from this scan's findings
+    // first and reports against it, so the same run already shows the
+    // state it wrote; it is the only write this tool performs besides
+    // the XDG cache.
+    let mut accepted: BTreeSet<String> = BTreeSet::new();
+    if update_baseline {
+        let Some(path) = baseline_path else {
+            let _ = writeln!(
+                stderr,
+                "sentinel: cannot update baseline: no baseline file given (pass --baseline <PATH> or set the `baseline` key)"
+            );
+            return ExitCode::from(errors::EXIT_OPERATIONAL);
+        };
+        let keys: BTreeSet<String> = findings.iter().map(|f| f.baseline_key()).collect();
+        let ordered: Vec<String> = keys.iter().cloned().collect();
+        match config::write_baseline(&path, &ordered) {
+            Ok(count) => {
+                diagnostics.push(Diagnostic::baseline_updated(
+                    &path.display().to_string(),
+                    count,
+                ));
+                accepted = keys;
+            }
+            Err(reason) => {
+                let _ = writeln!(
+                    stderr,
+                    "sentinel: cannot write baseline {}: {reason}",
+                    path.display()
+                );
+                return ExitCode::from(errors::EXIT_OPERATIONAL);
+            }
+        }
+    } else if let Some(path) = baseline_path {
+        let (known, invalid) = config::load_baseline(&path, &root);
+        diagnostics.extend(invalid);
+        let current: BTreeSet<String> = findings.iter().map(|f| f.baseline_key()).collect();
+        for stale in known.difference(&current) {
+            diagnostics.push(Diagnostic::baseline_stale(stale));
+        }
+        accepted = known.intersection(&current).cloned().collect();
+    }
+
     // Opt-in advisories: silent under `--ci`/`--offline` (byte-identical to no
     // flag); one `explain-skipped` when unconfigured; else a single call whose
     // text only reaches terminal output.
@@ -514,18 +568,28 @@ pub(crate) fn run_with_dep_client(
     // failures never mark the findings incomplete.
     let incomplete = diagnostics.iter().any(|d| !d.code.starts_with("explain-"));
     let report_bytes = match output {
-        // Without advisories the original renderer runs, so those bytes are
+        // Without advisories or acceptance the original renderer runs, so those bytes are
         // identical by construction, not just by delegation.
-        OutputFormat::Terminal if advisories.is_empty() => render::render_findings(&findings),
-        OutputFormat::Terminal => render::render_findings_with_advisories(&findings, &advisories),
+        OutputFormat::Terminal if advisories.is_empty() && accepted.is_empty() => {
+            render::render_findings(&findings)
+        }
+        OutputFormat::Terminal => render::render_terminal(&findings, &advisories, &accepted),
         OutputFormat::Json | OutputFormat::Sarif => {
             let rendered = match output {
                 // The complete path keeps the original renderer, so clean
                 // bytes are identical by construction, not just by delegation.
-                OutputFormat::Json if !incomplete => render::render_json(&findings),
-                OutputFormat::Json => render::render_json_with_status(&findings, true),
-                OutputFormat::Sarif if !incomplete => render::render_sarif(&findings),
-                OutputFormat::Sarif => render::render_sarif_with_status(&findings, true),
+                OutputFormat::Json if !incomplete && accepted.is_empty() => {
+                    render::render_json(&findings)
+                }
+                OutputFormat::Json => {
+                    render::render_json_with_status_and_accepted(&findings, incomplete, &accepted)
+                }
+                OutputFormat::Sarif if !incomplete && accepted.is_empty() => {
+                    render::render_sarif(&findings)
+                }
+                OutputFormat::Sarif => {
+                    render::render_sarif_with_status_and_accepted(&findings, incomplete, &accepted)
+                }
                 OutputFormat::Terminal => unreachable!(),
             };
             match rendered {
@@ -547,10 +611,12 @@ pub(crate) fn run_with_dep_client(
         return ExitCode::from(errors::EXIT_OPERATIONAL);
     }
 
-    // Exit policy (S3): only findings at or above the threshold fail the
-    // build; `none` is report-only. Scans that did not run already returned
-    // exit 2 above, and diagnostics never reach this decision.
-    if findings_fail_build(&findings, policy) {
+    // Exit policy (S3) with baseline acceptance (S5): only *unaccepted*
+    // findings at or above the threshold fail the build — accepting a
+    // finding quiets it without hiding it; `none` is report-only. Scans
+    // that did not run already returned exit 2 above, and diagnostics
+    // (including `baseline-stale`) never reach this decision.
+    if findings_fail_build(&findings, policy, &accepted) {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
@@ -558,12 +624,20 @@ pub(crate) fn run_with_dep_client(
 }
 
 /// Whether a completed scan's findings fail the build under `policy`: at
-/// least one finding at or above the threshold severity. Severity ordering
-/// comes from [`finding::Severity`]'s `Ord`, so the comparison cannot drift
-/// from the finding model; `None` (report-only) never fails.
-fn findings_fail_build(findings: &[Finding], policy: FailUnder) -> bool {
+/// least one *unaccepted* finding at or above the threshold severity.
+/// Baseline-accepted findings still report, but they never count here —
+/// otherwise accepting would be pointless. Severity ordering comes from
+/// [`finding::Severity`]'s `Ord`, so the comparison cannot drift from the
+/// finding model; `None` (report-only) never fails.
+fn findings_fail_build(
+    findings: &[Finding],
+    policy: FailUnder,
+    accepted: &BTreeSet<String>,
+) -> bool {
     match policy.threshold() {
-        Some(minimum) => findings.iter().any(|finding| finding.severity >= minimum),
+        Some(minimum) => findings.iter().any(|finding| {
+            !accepted.contains(&finding.baseline_key()) && finding.severity >= minimum
+        }),
         None => false,
     }
 }
@@ -1837,5 +1911,424 @@ mod tests {
             out_text.contains("skipped.env:1:"),
             "--ci disables the target info/exclude: {out_text}"
         );
+    }
+
+    /// Baseline helpers (S5): the baseline file lives outside the scanned
+    /// repository, so its own bytes never enter the scan, in exactly the
+    /// format `--update-baseline` writes.
+    fn baseline_outside_repo() -> (TempDir, PathBuf, String) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("accepted.json");
+        let arg = path.to_str().unwrap().to_string();
+        (dir, path, arg)
+    }
+
+    /// A repository whose only finding is the medium synthetic token.
+    fn token_only_repo() -> (TempDir, PathBuf) {
+        let (dir, root) = temp_repo();
+        write_tracked(
+            &root,
+            OsStr::new("token.env"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        (dir, root)
+    }
+
+    /// Accepts every current finding by regenerating the baseline, and
+    /// asserts the update run already reports against what it wrote.
+    fn accept_all(root: &Path, baseline_arg: &str) {
+        let (code, out, err) = run_scan(
+            &["scan", "--baseline", baseline_arg, "--update-baseline"],
+            root,
+        );
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "the update run reports against the baseline it just wrote"
+        );
+        assert!(
+            String::from_utf8(out).unwrap().contains("[accepted]"),
+            "the update run marks what it accepted"
+        );
+        assert!(
+            String::from_utf8(err).unwrap().contains("baseline-updated"),
+            "the update reports what it wrote"
+        );
+    }
+
+    /// The semantic heart (S5): a repository whose only finding is accepted
+    /// exits 0 under the default policy — accepting must actually quiet the
+    /// build — and stops exiting 0 when the baseline is removed.
+    #[test]
+    fn accepted_finding_does_not_fail_the_build_but_resurfaces_without_baseline() {
+        let (_dir, root) = token_only_repo();
+        let plain = run_scan(&["scan"], &root);
+        assert_eq!(
+            plain.0,
+            ExitCode::from(1),
+            "unaccepted finding fails the build"
+        );
+        let plain_text = String::from_utf8(plain.1).unwrap();
+        assert!(plain_text.contains("SECRET-synthetic-token"));
+        assert!(
+            !plain_text.contains("SECRET-aws-access-key"),
+            "exactly one finding: {plain_text}"
+        );
+        let (_outside, baseline, bl) = baseline_outside_repo();
+        accept_all(&root, &bl);
+        assert!(baseline.exists(), "the update writes the file it is given");
+        let (code, out, err) = run_scan(&["scan", "--baseline", &bl], &root);
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "an accepted finding must not fail the build"
+        );
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(
+            out_text.contains("SECRET-synthetic-token"),
+            "accepted findings are still reported: {out_text}"
+        );
+        assert!(
+            out_text.contains("[accepted]"),
+            "acceptance is visible: {out_text}"
+        );
+        assert!(
+            String::from_utf8(err).unwrap().is_empty(),
+            "no diagnostics on the accepted path"
+        );
+        std::fs::remove_file(&baseline).unwrap();
+        let (code, out, err) = run_scan(&["scan", "--baseline", &bl], &root);
+        assert_eq!(
+            code,
+            ExitCode::from(1),
+            "without the baseline the same finding fails again"
+        );
+        assert!(
+            String::from_utf8(err).unwrap().contains("baseline-invalid"),
+            "the missing file warns once instead of vanishing silently"
+        );
+        assert!(
+            !String::from_utf8(out).unwrap().contains("[accepted]"),
+            "nothing is marked without a baseline"
+        );
+    }
+
+    /// Accepted and unaccepted findings report side by side: the baseline
+    /// built in a token-only repository accepts the token everywhere, while
+    /// the unknown key still fails the build unmarked.
+    #[test]
+    fn accepted_and_unaccepted_findings_report_side_by_side() {
+        let (_d1, r1) = token_only_repo();
+        let (_outside, _baseline, bl) = baseline_outside_repo();
+        accept_all(&r1, &bl);
+        let (_d2, r2) = secret_repo();
+        let (code, out, _) = run_scan(&["scan", "--baseline", &bl], &r2);
+        assert_eq!(
+            code,
+            ExitCode::from(1),
+            "the unaccepted key still fails the build"
+        );
+        let text = String::from_utf8(out).unwrap();
+        let token_lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("SECRET-synthetic-token"))
+            .collect();
+        assert_eq!(token_lines.len(), 1, "one token finding: {text:?}");
+        assert!(
+            token_lines[0].contains("[accepted]"),
+            "the known token is marked: {text:?}"
+        );
+        let key_lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("SECRET-aws-access-key"))
+            .collect();
+        assert_eq!(key_lines.len(), 1, "one key finding: {text:?}");
+        assert!(
+            !key_lines[0].contains("[accepted]"),
+            "the unknown key stays unmarked: {text:?}"
+        );
+    }
+
+    /// A rename must not resurrect an accepted finding (L4): the baseline
+    /// key carries no location, so moving the file keeps it accepted.
+    #[test]
+    fn accepted_finding_survives_a_file_rename() {
+        let (_dir, root) = temp_repo();
+        write_tracked(
+            &root,
+            OsStr::new("a.env"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        let (_outside, _baseline, bl) = baseline_outside_repo();
+        accept_all(&root, &bl);
+        crate::test_util::git(&root, ["mv", "a.env", "b.env"]);
+        let (code, out, err) = run_scan(&["scan", "--baseline", &bl], &root);
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "a rename must not resurrect an accepted finding"
+        );
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(
+            out_text.contains("b.env:1:"),
+            "the finding moved: {out_text}"
+        );
+        assert!(
+            !out_text.contains("a.env"),
+            "the old path is gone: {out_text}"
+        );
+        assert!(
+            out_text.contains("[accepted]"),
+            "still accepted: {out_text}"
+        );
+        assert!(String::from_utf8(err).unwrap().is_empty());
+    }
+
+    /// A stale entry — a fingerprint matching no current finding — is
+    /// reported on stderr, and it never fails the build in either
+    /// direction: accepted-only still exits 0, unaccepted still exits 1.
+    #[test]
+    fn stale_baseline_entries_are_reported_without_failing_the_build() {
+        let (_dir, root) = token_only_repo();
+        let (_outside, baseline, bl) = baseline_outside_repo();
+        accept_all(&root, &bl);
+        let stale = "secrets/SECRET-synthetic-token/".to_string() + &"0".repeat(64);
+        let text = std::fs::read_to_string(&baseline).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["fingerprints"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::Value::String(stale.clone()));
+        std::fs::write(&baseline, serde_json::to_vec(&value).unwrap()).unwrap();
+        let (code, out, err) = run_scan(&["scan", "--baseline", &bl], &root);
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "stale entries never fail the build"
+        );
+        let err_text = String::from_utf8(err).unwrap();
+        assert!(err_text.contains("baseline-stale"), "reported: {err_text}");
+        assert!(err_text.contains(&stale), "names the entry: {err_text}");
+        assert!(
+            String::from_utf8(out).unwrap().contains("[accepted]"),
+            "the live finding stays accepted"
+        );
+        // A baseline of only the stale entry: the finding is unaccepted.
+        std::fs::write(
+            &baseline,
+            serde_json::json!({"schema_version": "1.0.0", "fingerprints": [stale]}).to_string(),
+        )
+        .unwrap();
+        let (code, out, err) = run_scan(&["scan", "--baseline", &bl], &root);
+        assert_eq!(code, ExitCode::from(1), "unaccepted finding still fails");
+        assert!(
+            String::from_utf8(err).unwrap().contains("baseline-stale"),
+            "stale still reported"
+        );
+        assert!(
+            !String::from_utf8(out).unwrap().contains("[accepted]"),
+            "nothing marked without a live entry"
+        );
+    }
+
+    /// A baseline that is not JSON warns exactly once and the scan
+    /// continues with nothing accepted — a typo never silently passes.
+    #[test]
+    fn malformed_baseline_warns_once_and_scan_continues() {
+        let (_dir, root) = token_only_repo();
+        let (_outside, baseline, bl) = baseline_outside_repo();
+        std::fs::write(&baseline, b"not json{{").unwrap();
+        let (code, out, err) = run_scan(&["scan", "--baseline", &bl], &root);
+        assert_eq!(
+            code,
+            ExitCode::from(1),
+            "nothing accepted means the finding fails"
+        );
+        let err_text = String::from_utf8(err).unwrap();
+        assert_eq!(
+            err_text.matches("baseline-invalid").count(),
+            1,
+            "exactly one diagnostic: {err_text}"
+        );
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(out_text.contains("SECRET-synthetic-token"));
+        assert!(!out_text.contains("[accepted]"));
+    }
+
+    /// Regenerating without a baseline path is an operational error: there
+    /// is no file the tool could honestly claim to have written.
+    #[test]
+    fn update_baseline_without_a_path_is_an_operational_error() {
+        let (_dir, root) = token_only_repo();
+        let (code, out, err) = run_scan(&["scan", "--update-baseline"], &root);
+        assert_eq!(code, ExitCode::from(2), "no file to write means exit 2");
+        assert!(out.is_empty(), "stdout must stay empty");
+        assert!(
+            String::from_utf8(err).unwrap().contains("baseline"),
+            "the error names the missing baseline"
+        );
+    }
+
+    /// The `baseline` config key flows end to end: the project file accepts
+    /// the finding with no flag, and the CLI flag wins over the project key.
+    #[test]
+    fn project_config_baseline_accepts_and_cli_wins_over_it() {
+        let (_dir, root) = token_only_repo();
+        write_untracked(
+            &root,
+            OsStr::new("sentinel.toml"),
+            b"baseline = \"accepted.json\"\n",
+        );
+        // No flag: the project key selects the file, relative to the repo.
+        let (code, _, _) = run_scan(&["scan", "--update-baseline"], &root);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(
+            root.join("accepted.json").exists(),
+            "config-relative writes root at the repository"
+        );
+        let (code, out, _) = run_scan(&["scan"], &root);
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "the configured baseline accepts the finding"
+        );
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(out_text.contains("[accepted]"));
+        assert!(
+            !out_text.contains("accepted.json"),
+            "the baseline file itself adds no findings: {out_text}"
+        );
+        // CLI points at an empty baseline: the project key loses.
+        let (_outside, empty, empty_arg) = baseline_outside_repo();
+        std::fs::write(
+            &empty,
+            serde_json::json!({"schema_version": "1.0.0", "fingerprints": []}).to_string(),
+        )
+        .unwrap();
+        let (code, _, err) = run_scan(&["scan", "--baseline", &empty_arg], &root);
+        assert_eq!(
+            code,
+            ExitCode::from(1),
+            "CLI --baseline wins over the project key"
+        );
+        assert!(String::from_utf8(err).unwrap().is_empty());
+    }
+
+    /// The target's project baseline applies when scanning another checkout
+    /// (S4): the config value roots at the target, never the caller.
+    #[test]
+    fn scan_applies_the_target_project_baseline() {
+        let (_caller_dir, caller_root) = temp_repo();
+        write_tracked(&caller_root, OsStr::new("clean.txt"), b"no secrets");
+        let (_target_dir, target_root) = token_only_repo();
+        write_untracked(
+            &target_root,
+            OsStr::new("sentinel.toml"),
+            b"baseline = \"accepted.json\"\n",
+        );
+        let target = target_root.to_str().unwrap();
+        let (code, _, _) = run_scan(&["scan", target, "--update-baseline"], &caller_root);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(
+            target_root.join("accepted.json").exists(),
+            "the update lands in the target checkout"
+        );
+        let (code, out, err) = run_scan(&["scan", target], &caller_root);
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "the target baseline accepts the finding"
+        );
+        assert!(String::from_utf8(out).unwrap().contains("[accepted]"));
+        assert!(String::from_utf8(err).unwrap().is_empty());
+    }
+
+    /// An empty baseline file is neutral: the scan is byte-identical to
+    /// having no baseline at all (stdout, stderr, and exit code).
+    #[test]
+    fn empty_baseline_file_leaves_the_scan_unchanged() {
+        let (_dir, root) = secret_repo();
+        let plain = run_scan(&["scan"], &root);
+        assert_eq!(plain.0, ExitCode::from(1));
+        let (_outside, empty, empty_arg) = baseline_outside_repo();
+        std::fs::write(
+            &empty,
+            serde_json::json!({"schema_version": "1.0.0", "fingerprints": []}).to_string(),
+        )
+        .unwrap();
+        let with_empty = run_scan(&["scan", "--baseline", &empty_arg], &root);
+        assert_eq!(plain, with_empty, "an empty baseline changes nothing");
+    }
+
+    /// Accepted findings do not count toward `--fail-under`: with the
+    /// critical finding accepted, a lone unaccepted medium cannot fail
+    /// `high` — yet it still fails the default policy on its own merit.
+    #[test]
+    fn accepted_findings_do_not_count_toward_fail_under() {
+        let (_d1, r1) = critical_only_repo();
+        let (_outside, _baseline, bl) = baseline_outside_repo();
+        accept_all(&r1, &bl);
+        let (_d2, r2) = secret_repo();
+        let (code, out, _) = run_scan(&["scan", "--baseline", &bl, "--fail-under", "high"], &r2);
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "the accepted critical must not reach the threshold"
+        );
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(out_text.contains("SECRET-aws-access-key"));
+        assert!(out_text.contains("SECRET-synthetic-token"));
+        let (code, _, _) = run_scan(&["scan", "--baseline", &bl], &r2);
+        assert_eq!(
+            code,
+            ExitCode::from(1),
+            "the unaccepted medium still fails the default policy"
+        );
+    }
+
+    /// Machine formats mark acceptance without changing shape: JSON gains
+    /// `"accepted": true` on accepted findings only, SARIF the standard
+    /// external suppression — and both still exit 0 when all is accepted.
+    #[test]
+    fn accepted_findings_are_marked_in_json_and_sarif_reports() {
+        let (_dir, root) = token_only_repo();
+        let (_outside, _baseline, bl) = baseline_outside_repo();
+        accept_all(&root, &bl);
+        let (code, out, _) = run_scan(&["scan", "--output", "json", "--baseline", &bl], &root);
+        assert_eq!(code, ExitCode::SUCCESS);
+        let report: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(report["schema_version"], "1.0.0");
+        let findings = report["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["accepted"], true);
+        let (code, out, _) = run_scan(&["scan", "--output", "sarif", "--baseline", &bl], &root);
+        assert_eq!(code, ExitCode::SUCCESS);
+        let log: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let results = log["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0]["suppressions"],
+            serde_json::json!([{"kind": "external", "status": "accepted"}])
+        );
+    }
+
+    /// Acceptance holds under `--ci` and `--offline`: neither mode changes
+    /// what the baseline accepts or how it reports.
+    #[test]
+    fn baseline_acceptance_holds_under_ci_and_offline() {
+        let (_dir, root) = token_only_repo();
+        let (_outside, _baseline, bl) = baseline_outside_repo();
+        accept_all(&root, &bl);
+        for extra in [&["--ci"][..], &["--offline"][..]] {
+            let mut args = vec!["scan", "--baseline", &bl];
+            args.extend(extra.iter());
+            let (code, out, err) = run_scan(&args, &root);
+            assert_eq!(code, ExitCode::SUCCESS, "mode {extra:?}");
+            assert!(
+                String::from_utf8(out).unwrap().contains("[accepted]"),
+                "mode {extra:?}"
+            );
+            assert!(String::from_utf8(err).unwrap().is_empty(), "mode {extra:?}");
+        }
     }
 }

@@ -3,7 +3,8 @@
 //!
 //! clap owns parsing; every rejected invocation is a usage error (stderr
 //! diagnostics, empty stdout, exit 2). `--ci`, `--offline`, `--output`,
-//! `--report`, `--exclude`, `--fail-under`, and the advisory-only `--explain`
+//! `--report`, `--exclude`, `--fail-under`, `--baseline`,
+//! `--update-baseline`, and the advisory-only `--explain`
 //! are the only supported scan options; anything else is rejected, so
 //! positional arguments and unknown flags cannot silently become no-ops. `completions` accepts only
 //! the shells clap_complete generates for this crate.
@@ -74,6 +75,28 @@ pub enum Command {
         /// Diagnostics, and scans that did not run (exit 2), are unaffected.
         #[arg(long, value_enum)]
         fail_under: Option<FailUnder>,
+        /// Path to a JSON baseline file listing accepted finding fingerprints
+        /// (see `--update-baseline` for the format). Findings whose baseline
+        /// key is listed still report — marked `[accepted]` on terminal,
+        /// `"accepted": true` in JSON, and an external accepted suppression
+        /// in SARIF — but never count toward `--fail-under`. A fingerprint
+        /// in the file matching no current finding warns once as
+        /// `baseline-stale`. Also settable as the `baseline` config key;
+        /// the flag wins over project config, which wins over user config.
+        /// Relative project-config values resolve against the repository
+        /// root, the flag against the invoking directory. Absent entirely,
+        /// the scan behaves exactly as today.
+        #[arg(long, value_name = "PATH")]
+        baseline: Option<PathBuf>,
+        /// Regenerate the baseline file from this scan's findings and report
+        /// against it: the file the `--baseline` flag or the `baseline`
+        /// config key names is rewritten with every current finding's
+        /// fingerprint (sorted, deduplicated), stale entries pruned. The
+        /// write is reported as `baseline-updated` on stderr; without any
+        /// baseline path the scan exits 2. This is the only write the tool
+        /// performs besides the XDG cache.
+        #[arg(long)]
+        update_baseline: bool,
     },
 }
 
@@ -347,6 +370,67 @@ mod tests {
         assert!(
             err.render().to_string().contains("PATH"),
             "help must document the scan target"
+        );
+    }
+    #[test]
+    fn baseline_flags_default_to_absent() {
+        let cli = parse(&args(&["scan"])).unwrap();
+        assert!(
+            matches!(
+                cli.command,
+                Command::Scan {
+                    baseline: None,
+                    update_baseline: false,
+                    ..
+                }
+            ),
+            "no baseline means today's behaviour exactly"
+        );
+    }
+    #[test]
+    fn baseline_flag_takes_a_path_and_update_flag_is_boolean() {
+        use std::path::PathBuf;
+        let cli = parse(&args(&["scan", "--baseline", "accepted.json"])).unwrap();
+        assert!(
+            matches!(cli.command, Command::Scan { baseline: Some(ref path), update_baseline: false, .. } if path == &PathBuf::from("accepted.json")),
+            "--baseline keeps its path verbatim for cwd-relative resolution"
+        );
+        let cli = parse(&args(&[
+            "scan",
+            "--baseline",
+            "accepted.json",
+            "--update-baseline",
+        ]))
+        .unwrap();
+        assert!(
+            matches!(cli.command, Command::Scan { baseline: Some(ref path), update_baseline: true, .. } if path == &PathBuf::from("accepted.json")),
+            "--update-baseline regenerates the file --baseline names"
+        );
+        let cli = parse(&args(&["scan", "--update-baseline"])).unwrap();
+        assert!(
+            matches!(
+                cli.command,
+                Command::Scan {
+                    baseline: None,
+                    update_baseline: true,
+                    ..
+                }
+            ),
+            "--update-baseline alone relies on the configured baseline path"
+        );
+    }
+    #[test]
+    fn scan_help_documents_the_baseline_flags() {
+        let err = parse(&args(&["scan", "--help"])).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        let text = err.render().to_string();
+        assert!(
+            text.contains("--baseline"),
+            "help must document the baseline file flag"
+        );
+        assert!(
+            text.contains("--update-baseline"),
+            "help must document the baseline regeneration flag"
         );
     }
 }

@@ -93,7 +93,9 @@ Secret values are always shown as `[REDACTED]`; what you see is where the findin
 
 The failure threshold is set with `--fail-under <critical|high|medium|low|none>` (or the `fail_under` key in `sentinel.toml` / the user config; the flag wins over project config, which wins over user config). It names the lowest severity that exits 1: `--fail-under high` fails on high and critical findings and ignores medium and low; `none` is report-only and exits 0 whenever the scan completed. The default is `low`, so any finding exits 1 — today's behaviour.
 
-Diagnostics (warnings such as skipped files or degraded advisory data) go to stderr and never change these codes: a completed scan exits 1 with findings at or above the threshold and 0 otherwise, however many warnings were printed.
+Findings listed in a [baseline](#baseline-of-accepted-findings) still report, but they never count toward the threshold: accepting a finding quiets the build without hiding the finding.
+
+Diagnostics (warnings such as skipped files or degraded advisory data) go to stderr and never change these codes: a completed scan exits 1 with unaccepted findings at or above the threshold and 0 otherwise, however many warnings were printed.
 
 ## Output formats
 
@@ -102,6 +104,27 @@ Diagnostics (warnings such as skipped files or degraded advisory data) go to std
 - **sarif** (`--output sarif`): SARIF 2.1.0 for CI ingestion, e.g. uploading to GitHub code scanning.
 
 Add `--report <PATH>` (with `json` or `sarif`) to write the machine-readable report to a file instead of stdout.
+
+## Baseline of accepted findings
+
+A repository can accept findings it has decided to live with, so adoption is incremental without editing code:
+
+```bash
+# Accept every current finding: writes the file, then reports against it
+sentinel scan --baseline sentinel-accepted.json --update-baseline
+
+# Later scans still report the accepted findings (marked `[accepted]`),
+# but they never count toward --fail-under
+sentinel scan --baseline sentinel-accepted.json
+```
+
+The file is JSON under the same `schema_version` envelope as the JSON report:
+
+```json
+{"schema_version":"1.0.0","tool":{"name":"sentinel","version":"0.1.0"},"fingerprints":["secrets/SECRET-synthetic-token/9f2c…"]}
+```
+
+Entries are keyed on finding fingerprints with the location removed (engine, rule id, content digest), so a renamed or moved file stays accepted while changed content reports fresh. The same file is selectable as the `baseline` key in `sentinel.toml` (or the user config); the flag wins over project config, which wins over user config. A fingerprint in the file matching no current finding warns once as `baseline-stale` on stderr — a baseline that only grows is a baseline nobody prunes. `--update-baseline` rewrites the file it is given (pruning stale entries) and reports what it wrote as `baseline-updated`; it is the only write the tool performs besides the XDG cache. An unreadable or malformed file warns once as `baseline-invalid` and the scan continues with nothing accepted.
 
 ## Quick Start (from source)
 
@@ -121,15 +144,21 @@ sentinel scan --ci
 sentinel scan --exclude '*.log' --exclude 'build/'
 
 # Fail the build only on high or critical findings (`none` is report-only;
-# default `low` means any finding exits 1)
+# default `low` means any finding exits 1). Accepted baseline findings never
+# count toward the threshold, whatever the level.
 sentinel scan --fail-under high
+
+# Accept every current finding, then enforce the baseline on later scans
+sentinel scan --baseline sentinel-accepted.json --update-baseline
+sentinel scan --baseline sentinel-accepted.json
 
 # The same excludes live in `sentinel.toml` at the repository root
 # (`exclude = ["*.log"]`), with a user-level file at
 # `$XDG_CONFIG_HOME/sentinel/config.toml` — or `SENTINEL_CONFIG` to pin
 # an explicit file instead (e.g. in CI); precedence is CLI flag >
 # project config > user config > built-in default, and exclude lists
-# union across levels. A bad config warns once and never aborts.
+# union across levels while scalar keys (`fail_under`, `baseline`) override.
+# A bad config warns once and never aborts.
 
 # Write SARIF 2.1.0 for CI ingestion
 sentinel scan --output sarif --report sentinel.sarif

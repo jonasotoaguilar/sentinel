@@ -78,6 +78,29 @@ pub(crate) fn sanitize(m: &str) -> String {
         .take(200)
         .collect()
 }
+impl Finding {
+    /// The baseline key: engine, rule id, and content digest without the
+    /// location segment, so renames, moves, and line shifts keep an
+    /// accepted finding accepted while changed content (a new digest) or a
+    /// changed rule reports fresh. Falls back to the full fingerprint when
+    /// it carries no location segment (defensive: every engine emits one).
+    pub fn baseline_key(&self) -> String {
+        let segments: Vec<&str> = self.id.split('/').collect();
+        if segments.len() > 2 {
+            // The path itself may hold slashes, so only the first two
+            // segments (engine, rule) and the last (digest) are stable.
+            format!(
+                "{}/{}/{}",
+                segments[0],
+                segments[1],
+                segments[segments.len() - 1]
+            )
+        } else {
+            self.id.clone()
+        }
+    }
+}
+
 impl Diagnostic {
     /// A tracked file could not be read; the file is skipped.
     pub fn read_failed(path: &str, error: &std::io::Error) -> Self {
@@ -251,6 +274,44 @@ impl Diagnostic {
             ),
         }
     }
+    /// A baseline file could not be read or parsed; the scan continues
+    /// with an empty baseline, so a typo never silently passes.
+    pub fn baseline_invalid(path: &str, reason: &str) -> Self {
+        Self {
+            code: "baseline-invalid",
+            path: path.to_string(),
+            rule: String::new(),
+            message: format!(
+                "baseline {reason}; fix the file or remove it to silence this warning"
+            ),
+        }
+    }
+    /// A baseline entry matches no current finding: worth pruning, never
+    /// worth failing the build over.
+    pub fn baseline_stale(fingerprint: &str) -> Self {
+        Self {
+            code: "baseline-stale",
+            path: String::new(),
+            rule: String::new(),
+            message: format!(
+                "baseline entry matches no finding: {fingerprint}; remove it to silence this warning"
+            ),
+        }
+    }
+    /// `--update-baseline` rewrote the baseline file; reports what it
+    /// wrote, since a silent write is indistinguishable from a lost one.
+    pub fn baseline_updated(path: &str, count: usize) -> Self {
+        Self {
+            code: "baseline-updated",
+            path: String::new(),
+            rule: String::new(),
+            message: if count == 1 {
+                format!("wrote 1 fingerprint to {path}")
+            } else {
+                format!("wrote {count} fingerprints to {path}")
+            },
+        }
+    }
 }
 
 /// Total scan budgets (S7). The production values were decided in L10, and
@@ -288,5 +349,84 @@ impl ScanBudgets {
             max_findings: 10_000,
             max_pins_per_request: 1_000,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finding_with_id(id: &str) -> Finding {
+        Finding {
+            id: id.to_string(),
+            engine: "secrets".to_string(),
+            rule_id: "SECRET-synthetic-token".to_string(),
+            severity: Severity::Medium,
+            location: Location {
+                path: "token.env".to_string(),
+                line: 1,
+                column: 1,
+                snippet: "[REDACTED]".to_string(),
+            },
+            message: "synthetic test token".to_string(),
+            evidence: "[REDACTED]".to_string(),
+        }
+    }
+
+    #[test]
+    fn baseline_key_drops_the_location_segment() {
+        // Same content and rule, different paths and lines: one key, so a
+        // rename, a move, or a line shift keeps the finding accepted (L4).
+        let digest = "9f".repeat(32);
+        let renamed = finding_with_id(&format!(
+            "secrets/SECRET-synthetic-token/renamed.env:9:4/{digest}"
+        ));
+        let original = finding_with_id(&format!(
+            "secrets/SECRET-synthetic-token/token.env:1:1/{digest}"
+        ));
+        assert_eq!(renamed.baseline_key(), original.baseline_key());
+        assert_eq!(
+            original.baseline_key(),
+            format!("secrets/SECRET-synthetic-token/{digest}")
+        );
+    }
+
+    #[test]
+    fn baseline_key_keeps_engine_rule_and_digest() {
+        let digest = "ab".repeat(32);
+        let base = finding_with_id(&format!(
+            "secrets/SECRET-synthetic-token/token.env:1:1/{digest}"
+        ));
+        // A changed secret (new digest) reports fresh, even at the same path.
+        let changed = finding_with_id(&format!(
+            "secrets/SECRET-synthetic-token/token.env:1:1/{}",
+            "cd".repeat(32)
+        ));
+        assert_ne!(base.baseline_key(), changed.baseline_key());
+        // Same digest under another rule is another key.
+        let other_rule = finding_with_id(&format!("secrets/SECRET-other/token.env:1:1/{digest}"));
+        assert_ne!(base.baseline_key(), other_rule.baseline_key());
+        // Dependency fingerprints project the same way: pin location
+        // dropped, advisory and content hash kept.
+        let dep = finding_with_id(&format!(
+            "dependency/OSV-GHSA-abc/package-lock.json:3:7/{digest}"
+        ));
+        assert_eq!(
+            dep.baseline_key(),
+            format!("dependency/OSV-GHSA-abc/{digest}")
+        );
+    }
+
+    #[test]
+    fn baseline_diagnostics_name_their_subject() {
+        let invalid = Diagnostic::baseline_invalid("accepted.json", "cannot read: gone");
+        assert_eq!(invalid.code, "baseline-invalid");
+        assert!(invalid.message.contains("cannot read"), "{invalid:?}");
+        let stale = Diagnostic::baseline_stale("secrets/SECRET-x/00");
+        assert_eq!(stale.code, "baseline-stale");
+        assert!(stale.message.contains("secrets/SECRET-x/00"), "{stale:?}");
+        let updated = Diagnostic::baseline_updated("accepted.json", 2);
+        assert_eq!(updated.code, "baseline-updated");
+        assert!(updated.message.contains('2'), "{updated:?}");
     }
 }
