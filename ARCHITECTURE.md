@@ -197,7 +197,7 @@ classDiagram
 - **Hermetic CI behavior**: in CI mode, the `ignore` walker disables ambient sources — `parents(false)` (no ignore files above the repo root), `git_global(false)` (no user-global `.gitignore`), `git_exclude(false)` (no `.git/info/exclude`), and `require_git(true)` — so results depend only on repository-local `.gitignore`, the repo-local custom ignore file (e.g., `.sentinelignore` via `add_custom_ignore_filename`), and explicit exclusions (CLI glob patterns). File name of the custom ignore file is confirmed during implementation planning.
 - **Scaling**: Parallel walk is not needed; the file set is a flat list consumed by the parallel engine stage. A maximum-file-size guard bounds pathological inputs.
 - **Dependencies**: `git` executable present on PATH (hard dependency — verified up front with a clear error otherwise); ignore crate.
-- **Failure modes**: Not a git repository or git missing → hard error, exit code 2 (discovery is fundamental to correctness). Unreadable files / broken symlinks → skip with warning at debug level.
+- **Failure modes**: Not a git repository or git missing → hard error, exit code 2 (discovery is fundamental to correctness). Unreadable files / broken symlinks → skip with a `read-failed` diagnostic on stderr; the scan continues and the exit code is unaffected.
 
 ### Detector Engines (Rayon, parallel)
 
@@ -252,10 +252,10 @@ All engines share one contract: file or manifest input → zero or more **raw fi
 - **Technology**: Rust, ureq (synchronous HTTPS); isolated module behind an `Explainer` interface (HTTP adapter + test stub adapter).
 - **Responsibility**: When explicitly enabled, produce advisory explanation text for findings. Enforced boundaries (see ADR-0003):
   - Context is built **exclusively from redacted findings** — the redaction boundary in the engines makes raw secret values structurally unreachable.
-  - Fixed context budget (max characters per finding and per scan); single synchronous HTTP call per finding (or small batch), no retries.
+  - Fixed context budget (`MAX_FINDINGS = 20` findings, `MAX_CONTEXT_BYTES = 4096` bytes of serialized redacted context per scan); a single synchronous HTTP call per scan carrying that batch, no retries.
   - Responses are **untrusted**: length-capped, control characters stripped, treated as display-only strings — never parsed into severity, blocking, or exit-code structures (those are immutable after normalization).
   - **Disabled by default**; forced off in CI mode and offline mode; failure (timeout, error, missing key) → warning only, output identical to a scan without `--explain`.
-- **Scaling**: None — per-finding synchronous calls, opt-in only.
+- **Scaling**: None — one synchronous call per scan, opt-in only.
 - **Dependencies**: Normalized findings (redacted); network; user-provided endpoint/key configuration.
 - **Failure modes**: Any failure is a warn-and-continue; zero impact on findings, severity, ordering, or exit code.
 
@@ -313,8 +313,7 @@ All engines share one contract: file or manifest input → zero or more **raw fi
 ### Observability
 
 - Diagnostics are reported on stderr as structured findings; stdout is reserved for findings/reports. There is no logging framework.
-- Structured spans per stage (scan, discovery, per-engine, normalize, render, explain); events for degradations (OSV degraded, cache miss, LLM skipped/failed) at warn level in default verbosity.
-- Verbosity controlled via `RUST_LOG`; spans/events must never carry secret material (only redacted evidence and counts).
+- Degradations (OSV degraded, cache miss, LLM skipped/failed) surface as structured diagnostics on stderr in default verbosity; diagnostics must never carry secret material (only redacted evidence and counts).
 - Alerting before users report does not apply (local CLI, no service) — the analogous contract is: warnings reach stderr in default mode, and failures map to stable exit codes.
 
 ### Maintainability
@@ -369,7 +368,7 @@ All engines share one contract: file or manifest input → zero or more **raw fi
 | Too many pins for one batch (over 1 000) | Oversized request; one failure loses much | Split queries into 1 000-pin requests (chunking, no truncation, no diagnostic); pagination (`MAX_PAGES = 3`) still bounds pages *within* one request; concatenated results stay index-aligned, so output is unchanged |
 | `--explain` endpoint failure/timeout | Missing advisory text | Single attempt, no retries, bounded timeout; warn + continue; findings/severity/exit code byte-identical to the non-explain scan (validated by differential tests) |
 | Ambient ignore config leaks into CI results | Non-hermetic, machine-dependent scans | Hermetic CI mode disables parent/global/exclude ignore sources; validated by tests planting ignore files above the repo root and asserting no effect |
-| Unreadable file / broken symlink mid-scan | Engine misses a file | Skip with warning (debug level); scan continues; exit code unaffected |
+| Unreadable file / broken symlink mid-scan | Engine misses a file | Skip with a `read-failed` diagnostic on stderr; scan continues; exit code unaffected |
 
 > Failure validation: every network/cache row above carries a test-based validation (stub server, seeded cache fixtures, corruption fixtures) — the mitigations are exercised in CI, not just intended.
 
