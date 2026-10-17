@@ -22,6 +22,13 @@ The CLI MUST expose exactly two subcommands: `sentinel scan` with options `--ci`
 - WHEN `sentinel scan` runs
 - THEN the flag is honored (`--ci` hermetic; `--offline` zero HTTP; `--explain` advisory-only); exit 0 or 1
 
+#### Scenario: Explain flag accepted and inert under CI and offline
+
+- GIVEN `--explain`, `--explain --ci`, and `--explain --offline`
+- WHEN `sentinel scan` runs
+- THEN the same findings, severity, ordering and exit code are produced as without
+  `--explain`, and no explanation request is issued in the `--ci` or `--offline` runs
+
 #### Scenario: Usage errors
 
 - GIVEN a positional, `--output yaml`, an unknown subcommand, or no subcommand
