@@ -268,3 +268,86 @@ jobs:
             --target "$GITHUB_SHA" \
             $PRE \
             "${ARCHIVES[@]}" "$CHECKSUMS" "$SBOM"
+
+  docker:
+    name: publish image
+    # Additive by construction: runs only after the `publish` job created
+    # the Release (three per-target archives, checksums, SBOM, build
+    # provenance and SBOM attestations, one Release), so an image failure
+    # can never take the release assets down with it. Exercise runs
+    # (workflow_dispatch) reach this job too, which usefully proves the
+    # Dockerfile on every test release; only real `v*` tags additionally
+    # move `:latest`.
+    needs: [publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Narrowest set that works: `contents: read` checks the build context
+    # out, `packages: write` pushes to GHCR. Scoped to this job on purpose:
+    # every other job keeps exactly the permissions it already had.
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Log in to GitHub Container Registry
+        # Docker's own actions (with docker/build-push-action below): both
+        # are maintained by Docker and are the standard way to publish
+        # images from Actions — no third-party publisher in the loop, and
+        # no hand-rolled `docker login` that could leak the token into a
+        # process list or a log. Justification for the exception to the
+        # actions/*-only rule: pushing to a registry is not something the
+        # official actions cover, and reimplementing auth and BuildKit
+        # plumbing in shell would be more code to review for less safety.
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image tags
+        # Same single-source-of-truth rule as the publish job: tag pushes
+        # use the tag, exercise runs use the input or a sha-based name.
+        # Full releases (`v*`, the only ones the publish job leaves as
+        # non-prereleases) additionally move `:latest`; prereleases and
+        # exercise builds publish only their own tag. The owner is
+        # lowercased because GHCR rejects uppercase namespace segments.
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+          if [ -z "$TAG" ]; then
+            TAG="workflow-test-${GITHUB_SHA::8}"
+          fi
+          OWNER="$(tr 'A-Z' 'a-z' <<<"${{ github.repository_owner }}")"
+          TAGS="ghcr.io/${OWNER}/sentinel:${TAG}"
+          case "$TAG" in
+            v*) TAGS="${TAGS}$(printf '\nghcr.io/%s/sentinel:latest' "$OWNER")" ;;
+          esac
+          {
+            echo "IMAGE_TAGS<<EOF"
+            printf '%s\n' "$TAGS"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+          printf 'Image tags:\n%s\n' "$TAGS"
+
+      - name: Build and push image
+        # Allowed to fail on purpose: the Release this image belongs to is
+        # already published by the `publish` job, and a registry outage, a
+        # transient network failure, or a GHCR permission change is outside
+        # this workflow's control — none of those may retroactively fail a
+        # release whose verifiable artifacts are already out. The failure
+        # mode within our control (a broken Dockerfile) is caught before
+        # merge with a local `docker build` (see the Dockerfile header),
+        # never by the release run.
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_TAGS }}
