@@ -79,11 +79,13 @@ Secret values are always shown as `[REDACTED]`; what you see is where the findin
 
 | Code | Meaning |
 |------|---------|
-| 0 | The scan completed and found nothing. |
-| 1 | The scan completed and reported findings. |
+| 0 | The scan completed and no finding reached the failure threshold. |
+| 1 | The scan completed and reported a finding at or above the failure threshold. |
 | 2 | The scan did not run: a usage error (unknown flag, `--report` with terminal output, missing subcommand), not inside a Git repository, `git` unavailable, or the report could not be rendered or written. |
 
-Diagnostics (warnings such as skipped files or degraded advisory data) go to stderr and never change these codes: a completed scan exits 1 with findings and 0 without them, however many warnings were printed.
+The failure threshold is set with `--fail-under <critical|high|medium|low|none>` (or the `fail_under` key in `sentinel.toml` / the user config; the flag wins over project config, which wins over user config). It names the lowest severity that exits 1: `--fail-under high` fails on high and critical findings and ignores medium and low; `none` is report-only and exits 0 whenever the scan completed. The default is `low`, so any finding exits 1 — today's behaviour.
+
+Diagnostics (warnings such as skipped files or degraded advisory data) go to stderr and never change these codes: a completed scan exits 1 with findings at or above the threshold and 0 otherwise, however many warnings were printed.
 
 ## Output formats
 
@@ -106,6 +108,10 @@ sentinel scan --ci
 
 # Exclude files by glob (repeatable; `.gitignore` semantics, repo-relative paths)
 sentinel scan --exclude '*.log' --exclude 'build/'
+
+# Fail the build only on high or critical findings (`none` is report-only;
+# default `low` means any finding exits 1)
+sentinel scan --fail-under high
 
 # The same excludes live in `sentinel.toml` at the repository root
 # (`exclude = ["*.log"]`), with a user-level file at
