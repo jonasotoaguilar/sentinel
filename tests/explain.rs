@@ -536,6 +536,347 @@ fn redirect_is_a_failure_without_a_second_request() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Path-redaction sweep: no secret in a file or directory name may leave the
+// process through any exit (terminal, stderr, report files, payloads).
+// ---------------------------------------------------------------------------
+
+/// Seeds one OSV cache record at the exact `src/cache.rs` layout under
+/// `$XDG_CACHE_HOME/sentinel/...`, mirroring `tests/dependency.rs` so the
+/// dependency review answers from cache without touching the network.
+fn seed_cache(xdg: &Path, eco: &str, pkg: &str, ver_enc: &str, bytes: &[u8]) {
+    let path = xdg
+        .join("sentinel")
+        .join("osv")
+        .join("v1")
+        .join(eco)
+        .join(pkg)
+        .join(format!("{ver_enc}.json"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+}
+
+const SEEDED_ADVISORY: &[u8] = br#"[{"id":"GHSA-SEED1","summary":"seeded advisory","severity":[{"type":"CVSS_V3","score":"9.8"}]}]"#;
+
+/// A manifest pinning a secret as the package name, plus a seeded cache hit
+/// for that pin, so the dependency review emits a finding for it.
+fn secret_coordinate_repo() -> (TempDir, PathBuf, TempDir) {
+    let (dir, root) = temp_repo();
+    write_tracked(
+        &root,
+        "requirements.txt",
+        format!("{TOKEN}==1.0.0\n").as_bytes(),
+    );
+    let xdg = TempDir::new().unwrap();
+    seed_cache(
+        xdg.path(),
+        "PyPI",
+        "sk%2Dsynthetic%2D1234567890",
+        "1%2E0%2E0",
+        SEEDED_ADVISORY,
+    );
+    (dir, root, xdg)
+}
+
+/// A manifest under a secret-bearing directory plus a seeded cache hit, so
+/// the dependency review emits one finding deterministically and offline.
+fn secret_manifest_repo() -> (TempDir, PathBuf, TempDir) {
+    let (dir, root) = temp_repo();
+    let rel = format!("deps/{AWS_KEY}/requirements.txt");
+    std::fs::create_dir_all(root.join(format!("deps/{AWS_KEY}"))).unwrap();
+    write_tracked(&root, &rel, b"flask==2.3.3\n");
+    let xdg = TempDir::new().unwrap();
+    seed_cache(xdg.path(), "PyPI", "flask", "2%2E3%2E3", SEEDED_ADVISORY);
+    (dir, root, xdg)
+}
+
+/// Runs the binary with a hermetic OSV cache and no explain configuration.
+fn scan_cached(root: &Path, xdg: &TempDir, args: &[&str]) -> Output {
+    let mut cmd = AssertCommand::cargo_bin("sentinel").unwrap();
+    cmd.arg("scan")
+        .current_dir(root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("HOME", root)
+        .env("XDG_CACHE_HOME", xdg.path());
+    cmd.args(args);
+    cmd.output().unwrap()
+}
+
+/// Runs the binary pointed at the stub endpoint with a hermetic OSV cache.
+fn scan_explained_cached(root: &Path, url: &str, xdg: &TempDir, args: &[&str]) -> Output {
+    scan_explained_with_env(
+        root,
+        url,
+        args,
+        &[("XDG_CACHE_HOME", xdg.path().to_str().unwrap())],
+    )
+}
+
+#[test]
+fn manifest_path_secret_never_leaves_stdout_stderr_or_payload() {
+    let (dir, root, xdg) = secret_manifest_repo();
+    let (url, bodies, count) = stub_server(Respond::Echo);
+    let output = scan_explained_cached(&root, &url, &xdg, &["--explain", "--output", "json"]);
+    let blob = text_of(&output.stdout)
+        + &text_of(&output.stderr)
+        + &text_of(&bodies.lock().unwrap().concat());
+    assert!(!blob.contains(AWS_KEY), "{blob}");
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    drop(dir);
+}
+
+#[test]
+fn skipped_large_path_is_redacted_on_stderr() {
+    let (dir, root) = temp_repo();
+    let name = format!("{AWS_KEY}.bin");
+    let path = root.join(&name);
+    std::fs::write(&path, b"").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(10 * 1024 * 1024)
+        .unwrap();
+    git(&root, ["add", "--", name.as_str()]);
+    git(&root, ["commit", "-qm", "big"]);
+    let output = scan(&root, &[]);
+    assert!(
+        !text_of(&output.stderr).contains(AWS_KEY),
+        "{}",
+        text_of(&output.stderr)
+    );
+    assert!(text_of(&output.stderr).contains("skipped-large"));
+    drop(dir);
+}
+
+#[test]
+fn dependency_finding_path_is_redacted_on_terminal() {
+    let (dir, root, xdg) = secret_manifest_repo();
+    let output = scan_cached(&root, &xdg, &[]);
+    assert_eq!(output.status.code(), Some(1), "the finding still reports");
+    let stdout = text_of(&output.stdout);
+    let stderr = text_of(&output.stderr);
+    assert!(
+        !stdout.contains(AWS_KEY) && !stderr.contains(AWS_KEY),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stdout.contains("OSV-GHSA-SEED1"), "stdout: {stdout}");
+    assert!(stdout.contains("[REDACTED]"), "stdout: {stdout}");
+    drop(dir);
+}
+
+#[test]
+fn dependency_finding_path_is_redacted_in_sarif() {
+    let (dir, root, xdg) = secret_manifest_repo();
+    let output = scan_cached(&root, &xdg, &["--output", "sarif"]);
+    assert_eq!(output.status.code(), Some(1), "the finding still reports");
+    let stdout = text_of(&output.stdout);
+    assert!(!stdout.contains(AWS_KEY), "{stdout}");
+    assert!(stdout.contains("REDACTED"), "{stdout}");
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    drop(dir);
+}
+
+#[test]
+fn dependency_finding_path_is_redacted_in_report_file() {
+    let (dir, root, xdg) = secret_manifest_repo();
+    let output = scan_cached(&root, &xdg, &["--output", "json", "--report", "out.json"]);
+    assert_eq!(output.status.code(), Some(1), "the finding still reports");
+    assert!(output.stdout.is_empty(), "stdout stays empty with --report");
+    let report = text_of(&std::fs::read(root.join("out.json")).unwrap());
+    assert!(!report.contains(AWS_KEY), "{report}");
+    assert!(report.contains("OSV-GHSA-SEED1"), "{report}");
+    assert!(report.contains("[REDACTED]"), "{report}");
+    drop(dir);
+}
+
+#[test]
+fn offline_cache_miss_path_is_redacted_on_stderr() {
+    let (dir, root) = temp_repo();
+    let rel = format!("deps/{AWS_KEY}/requirements.txt");
+    std::fs::create_dir_all(root.join(format!("deps/{AWS_KEY}"))).unwrap();
+    write_tracked(&root, &rel, b"flask==2.3.3\n");
+    let xdg = TempDir::new().unwrap();
+    let output = scan_cached(&root, &xdg, &["--offline"]);
+    let stderr = text_of(&output.stderr);
+    assert!(stderr.contains("osv-unavailable"), "stderr: {stderr}");
+    assert!(!stderr.contains(AWS_KEY), "stderr: {stderr}");
+    assert!(stderr.contains("[REDACTED]"), "stderr: {stderr}");
+    drop(dir);
+}
+
+#[test]
+fn manifest_parse_diagnostics_are_redacted_on_stderr() {
+    let (dir, root) = temp_repo();
+    let subdir = format!("deps/{AWS_KEY}");
+    std::fs::create_dir_all(root.join(&subdir)).unwrap();
+    write_tracked(
+        &root,
+        &format!("{subdir}/requirements.txt"),
+        b"flask>=2.0\n",
+    );
+    write_tracked(&root, &format!("{subdir}/package-lock.json"), b"{ invalid");
+    let output = scan(&root, &[]);
+    let stderr = text_of(&output.stderr);
+    assert!(
+        stderr.contains("version-unpinned-skipped"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("manifest-parse-failed"), "stderr: {stderr}");
+    assert!(!stderr.contains(AWS_KEY), "stderr: {stderr}");
+    drop(dir);
+}
+
+#[test]
+fn corrupt_cache_entry_path_is_redacted_on_stderr() {
+    let (dir, root) = temp_repo();
+    let rel = format!("deps/{AWS_KEY}/requirements.txt");
+    std::fs::create_dir_all(root.join(format!("deps/{AWS_KEY}"))).unwrap();
+    write_tracked(&root, &rel, b"flask==2.3.3\n");
+    let xdg = TempDir::new().unwrap();
+    seed_cache(xdg.path(), "PyPI", "flask", "2%2E3%2E3", b"{ not json");
+    let output = scan_cached(&root, &xdg, &["--offline"]);
+    let stderr = text_of(&output.stderr);
+    assert!(stderr.contains("cache-entry-corrupt"), "stderr: {stderr}");
+    assert!(!stderr.contains("osv-unavailable"), "stderr: {stderr}");
+    assert!(!stderr.contains(AWS_KEY), "stderr: {stderr}");
+    drop(dir);
+}
+
+#[test]
+fn fatal_error_path_is_redacted_on_stderr() {
+    let outer = TempDir::new().unwrap();
+    let cwd = outer.path().join(format!("not-a-repo-{AWS_KEY}"));
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut cmd = AssertCommand::cargo_bin("sentinel").unwrap();
+    cmd.arg("scan")
+        .current_dir(&cwd)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("HOME", &cwd);
+    let output = cmd.output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = text_of(&output.stderr);
+    assert!(stderr.contains("not inside a git repository"), "{stderr}");
+    assert!(!stderr.contains(AWS_KEY), "{stderr}");
+}
+
+#[test]
+fn usage_error_echoes_no_raw_secret() {
+    let (dir, root) = temp_repo();
+    let mut cmd = AssertCommand::cargo_bin("sentinel").unwrap();
+    cmd.arg("scan")
+        .arg(format!("deps/{AWS_KEY}/x"))
+        .current_dir(&root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("HOME", &root);
+    let output = cmd.output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = text_of(&output.stderr);
+    assert!(!stderr.contains(AWS_KEY), "{stderr}");
+    drop(dir);
+}
+
+#[test]
+fn package_coordinate_secret_never_leaves_the_payload() {
+    // A secret used as a package name travels in the dependency finding's
+    // snippet and message, past every per-field redaction: only a safety
+    // net over the serialized wire body can keep the absolute promise.
+    let (dir, root, xdg) = secret_coordinate_repo();
+    let (url, bodies, count) = stub_server(Respond::Echo);
+    let output = scan_explained_cached(&root, &url, &xdg, &["--explain"]);
+    assert_eq!(count.load(Ordering::SeqCst), 1, "one finding, one request");
+    assert_eq!(output.status.code(), Some(1), "the findings still report");
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1, "exactly one request per scan");
+    let body = text_of(&bodies[0]);
+    assert!(
+        !body.contains(TOKEN),
+        "a raw coordinate left the process: {body}"
+    );
+    drop(dir);
+}
+
+#[test]
+fn package_coordinate_secret_is_redacted_on_every_display_surface() {
+    // The coordinate travels in the dependency finding's snippet and message,
+    // so the display surfaces — terminal, JSON, SARIF, report file — must be
+    // proven, not just the payload.
+    let (dir, root, xdg) = secret_coordinate_repo();
+    for args in [&[][..], &["--output", "json"], &["--output", "sarif"]] {
+        let output = scan_cached(&root, &xdg, args);
+        assert_eq!(output.status.code(), Some(1), "args {args:?}");
+        let blob = text_of(&output.stdout) + &text_of(&output.stderr);
+        assert!(!blob.contains(TOKEN), "args {args:?}: {blob}");
+        assert!(blob.contains("OSV-GHSA-SEED1"), "args {args:?}: {blob}");
+    }
+    let output = scan_cached(&root, &xdg, &["--output", "json", "--report", "out.json"]);
+    assert!(output.stdout.is_empty(), "stdout stays empty with --report");
+    let report = text_of(&std::fs::read(root.join("out.json")).unwrap());
+    assert!(!report.contains(TOKEN), "{report}");
+    assert!(report.contains("[REDACTED]"), "{report}");
+    // Digest and dedupe are untouched: two findings survive with the id's
+    // pre-display digest suffix byte for byte.
+    let value: serde_json::Value = serde_json::from_str(&report).unwrap();
+    let findings = value["findings"].as_array().unwrap().clone();
+    assert_eq!(findings.len(), 2, "{report}");
+    let dep = findings
+        .iter()
+        .find(|f| f["rule_id"] == "OSV-GHSA-SEED1")
+        .unwrap();
+    assert!(
+        dep["id"]
+            .as_str()
+            .unwrap()
+            .ends_with("/d9888187af254602e6c0048f38635eff17af6eb62cfbc6695372975eb66fcea2"),
+        "{}",
+        dep["id"]
+    );
+    drop(dir);
+}
+
+#[test]
+fn redacted_payload_keeps_valid_json_shape_the_endpoint_parses() {
+    // Redacting a serialized document is only safe if the structure
+    // survives: the body must still parse with the same envelope, and the
+    // endpoint must still answer one advisory per requested finding.
+    let (dir, root, xdg) = secret_manifest_repo();
+    let (url, bodies, count) = stub_server(Respond::Echo);
+    let output = scan_explained_cached(&root, &url, &xdg, &["--explain"]);
+    assert_eq!(count.load(Ordering::SeqCst), 1, "one finding, one request");
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1, "exactly one request per scan");
+    let value: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
+    let items = value
+        .get("findings")
+        .and_then(|findings| findings.as_array())
+        .unwrap();
+    assert!(!items.is_empty(), "the budgeted finding still travels");
+    for item in items {
+        for key in [
+            "id", "rule_id", "severity", "path", "line", "column", "snippet", "message", "evidence",
+        ] {
+            assert!(item.get(key).is_some(), "entry lost {key}: {item}");
+        }
+    }
+    assert_eq!(advice_lines(&output.stdout).len(), items.len());
+    drop(dir);
+}
+
+#[test]
+fn rule_fallback_path_stays_redacted_on_stderr() {
+    let (dir, root) = temp_repo();
+    let name = format!("{AWS_KEY}.js");
+    write_tracked(&root, &name, b"function broken( {\n");
+    let output = scan(&root, &[]);
+    let stderr = text_of(&output.stderr);
+    assert!(stderr.contains("rule-fallback"), "stderr: {stderr}");
+    assert!(!stderr.contains(AWS_KEY), "stderr: {stderr}");
+    drop(dir);
+}
+
 #[test]
 fn outbound_body_never_exceeds_the_byte_cap() {
     // One maximal finding: its entry alone fits the entries-only budget,

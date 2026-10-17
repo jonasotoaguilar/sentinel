@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 
+use crate::engine::secrets::SecretsEngine;
 use crate::finding::{Diagnostic, Finding};
 
 mod json;
@@ -47,7 +48,14 @@ pub fn render_findings(findings: &[Finding]) -> Vec<u8> {
     render_findings_with_advisories(findings, &BTreeMap::new())
 }
 
-/// Renders diagnostics to stderr, sorted by `(code, path, rule)`.
+/// Renders diagnostics to stderr, sorted by `(code, path, rule)`. The path
+/// and the message are redacted with the production secret table on the way
+/// out: diagnostics are the only stderr exit and every producer (discovery,
+/// reading, scanning, dependency review, cache, explain) flows through here,
+/// so one render point covers producers present and future. Some messages
+/// embed the path (`version-unpinned-skipped`), which is why the message is
+/// redacted too; codes and rule ids are stable identifiers and stay exact.
+/// In-memory diagnostics keep the real path: nothing else reads them.
 pub fn render_diagnostics(diagnostics: &[Diagnostic]) -> Vec<u8> {
     let mut sorted: Vec<&Diagnostic> = diagnostics.iter().collect();
     sorted.sort();
@@ -55,12 +63,12 @@ pub fn render_diagnostics(diagnostics: &[Diagnostic]) -> Vec<u8> {
     for diagnostic in sorted {
         let mut parts = vec![format!("sentinel: {}", diagnostic.code)];
         if !diagnostic.path.is_empty() {
-            parts.push(diagnostic.path.clone());
+            parts.push(SecretsEngine::redact_production(&diagnostic.path));
         }
         if !diagnostic.rule.is_empty() {
             parts.push(format!("rule {}", diagnostic.rule));
         }
-        parts.push(diagnostic.message.clone());
+        parts.push(SecretsEngine::redact_production(&diagnostic.message));
         let _ = writeln!(out, "{}", parts.join(": "));
     }
     out

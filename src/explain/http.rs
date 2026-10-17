@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use super::{ExplainError, Explainer, Explanation};
+use crate::engine::secrets::SecretsEngine;
 use crate::finding::Finding;
 
 /// At most this many findings travel in the single request, canonical order.
@@ -78,7 +79,12 @@ impl HttpExplainer {
     /// and byte budgets, in canonical order. The byte budget covers the
     /// whole serialized body that leaves the process — entries, commas,
     /// and the envelope — never just the entries. Pure, so budgets are
-    /// unit testable without a network.
+    /// unit testable without a network. The returned document passes
+    /// through the production secret table as defence in depth: per-field
+    /// redaction upstream covers the known fields, and this pass covers
+    /// whatever any field — present or future — contains. Every table
+    /// match is longer than the placeholder, so redaction only shrinks
+    /// the body and the byte budget above still holds.
     fn body(findings: &[Finding]) -> String {
         let mut entries = Vec::new();
         for finding in findings.iter().take(MAX_FINDINGS) {
@@ -98,7 +104,8 @@ impl HttpExplainer {
                 break;
             }
         }
-        serde_json::json!({ "findings": entries }).to_string()
+        let serialized = serde_json::json!({ "findings": entries }).to_string();
+        SecretsEngine::redact_production(&serialized)
     }
 
     /// Parses the response envelope: an array of `{id, text}` objects with

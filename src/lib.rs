@@ -76,7 +76,12 @@ pub fn run_with_deps(
     let cli = match cli::parse(args) {
         Ok(cli) => cli,
         Err(usage) => {
-            let _ = write!(stderr, "{usage}");
+            // Usage errors echo the rejected argument, which may be a path.
+            let _ = write!(
+                stderr,
+                "{}",
+                SecretsEngine::redact_production(&usage.to_string())
+            );
             return ExitCode::from(errors::EXIT_OPERATIONAL);
         }
     };
@@ -108,7 +113,13 @@ pub fn run_with_deps(
     let discovered = match discovery::Git::new().discover(cwd, mode) {
         Ok(discovered) => discovered,
         Err(error) => {
-            let _ = writeln!(stderr, "sentinel: {error}");
+            // Fatal errors carry the invocation directory, which may itself
+            // hold a secret; only the form leaving the process is redacted.
+            let _ = writeln!(
+                stderr,
+                "sentinel: {}",
+                SecretsEngine::redact_production(&error.to_string())
+            );
             return ExitCode::from(errors::EXIT_OPERATIONAL);
         }
     };
@@ -179,9 +190,26 @@ pub fn run_with_deps(
             };
         crate::engine::dependency::DependencyEngine::online(dep_cache, osv)
     };
+    // The review reads through the original file list, so what is read,
+    // cached, and looked up stays byte-identical; only the finding's display
+    // forms (location path, snippet, message, and the fingerprint's path
+    // segment) are redacted here, at the single point every dependency
+    // finding crosses. Snippet and message need the same treatment because a
+    // secret used as a package coordinate travels in them. Secrets and rule
+    // findings arrive already redacted from the scan loop above, so terminal,
+    // JSON, SARIF, report files, and the explain payload that all render from
+    // these findings can no longer carry a raw value, and neither can
+    // advisory text keyed by finding id. Digests and dedupe keys are
+    // computed from pre-display values inside the engines and are untouched.
     let (dep_findings, dep_diags) = dep_engine.review(&root, &files);
     diagnostics.extend(dep_diags);
-    findings.extend(dep_findings);
+    findings.extend(dep_findings.into_iter().map(|mut finding| {
+        finding.location.path = SecretsEngine::redact_production(&finding.location.path);
+        finding.location.snippet = SecretsEngine::redact_production(&finding.location.snippet);
+        finding.message = SecretsEngine::redact_production(&finding.message);
+        finding.id = SecretsEngine::redact_production(&finding.id);
+        finding
+    }));
     let findings = normalize::dedupe_and_sort(findings);
 
     // Opt-in advisories: silent under `--ci`/`--offline` (byte-identical to no
