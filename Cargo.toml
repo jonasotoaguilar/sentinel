@@ -1,8 +1,34 @@
 [package]
-name = "sentinel"
+name = "sentinel-scan"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+# The crate name `sentinel` is taken on crates.io by an unrelated project,
+# so the package publishes as `sentinel-scan`. The library and binary keep
+# the name `sentinel`, so `use sentinel::...`, `cargo_bin("sentinel")`,
+# and every documented command are unchanged; only `cargo install` takes
+# the `sentinel-scan` name.
+description = "Scan Git repositories for secrets, vulnerable dependencies, and risky code patterns before commit or in CI"
+repository = "https://github.com/jonasotoaguilar/sentinel"
+keywords = ["security", "secrets", "scanner", "audit", "cli"]
+categories = ["command-line-utilities"]
+# Measured floor (see task log): edition 2024 needs 1.85, `if`-let chains
+# need 1.88, `usize::is_multiple_of` needs 1.87, and `str::floor_char_boundary`
+# (used in src/engine/dependency/map.rs and src/osv/validate.rs) needs 1.91
+# — clippy's `incompatible_msrv` lint confirmed 1.88 was too low. Verified by
+# building with a minimal 1.91 toolchain.
+rust-version = "1.91"
+
+[lib]
+name = "sentinel"
+
+[[bin]]
+name = "sentinel"
+path = "src/main.rs"
+
+[profile.release]
+# Smaller release archives with no runtime cost.
+strip = true
 
 [dependencies]
 blake3 = { version = "1", default-features = false, features = ["std"] }

@@ -1,0 +1,152 @@
+# Release: build per-target archives and publish one GitHub Release.
+#
+# Archive layout (named for the install docs): each archive holds a single
+# runnable binary at its top level —
+#   sentinel-<tag>-x86_64-unknown-linux-gnu.tar.gz  ->  sentinel
+#   sentinel-<tag>-aarch64-apple-darwin.tar.gz       ->  sentinel
+#   sentinel-<tag>-x86_64-pc-windows-msvc.zip        ->  sentinel.exe
+# plus one shared checksum file: sentinel-<tag>-checksums.txt
+# (sha256, verifiable with `sha256sum -c`).
+#
+# Design (deliberate, see the feature doc): a hand-written matrix on native
+# runners, so there is no cross-compilation and no release tooling beyond
+# the official `actions/*` steps and the preinstalled `gh` CLI. Each matrix
+# job builds natively (`cargo build --release`, no `--target`) and labels
+# its archive with the runner's native triple. A single `publish` job then
+# attaches every archive plus the checksums to one Release for the tag.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name for the exercise Release (e.g. v0.1.0-test). Leave empty for workflow-test-<sha>."
+        required: false
+        default: ""
+        type: string
+
+# The publish job creates the Release with the workflow's GITHUB_TOKEN.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native triples only: each runner builds for itself.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        # GitHub-hosted runners already ship rustup with stable; this is a
+        # cheap no-op guard so the build never depends on the image default.
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Archive binary
+        # bash runs everywhere (Git Bash on Windows), so one script covers
+        # both formats; Windows uses bsdtar's `-a` (format by extension).
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+          if [ -z "$TAG" ]; then
+            TAG="workflow-test-${GITHUB_SHA::8}"
+          fi
+          BIN="target/release/sentinel"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            BIN="${BIN}.exe"
+            EXT="zip"
+          else
+            EXT="tar.gz"
+          fi
+          test -f "$BIN"
+          mkdir -p dist staging
+          cp "$BIN" staging/
+          ARCHIVE="dist/sentinel-${TAG}-${{ matrix.target }}.${EXT}"
+          if [ "$EXT" = "zip" ]; then
+            tar -a -cf "$ARCHIVE" -C staging "$(basename "$BIN")"
+          else
+            tar -czf "$ARCHIVE" -C staging "$(basename "$BIN")"
+          fi
+          ls -la dist/
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-archive-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-archive-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+          if [ -z "$TAG" ]; then
+            TAG="workflow-test-${GITHUB_SHA::8}"
+          fi
+          cd dist
+          shopt -s nullglob
+          ARCHIVES=(sentinel-*.tar.gz sentinel-*.zip)
+          if [ "${#ARCHIVES[@]}" -ne 3 ]; then
+            echo "::error::expected 3 per-target archives, found ${#ARCHIVES[@]}: ${ARCHIVES[*]:-<none>}"
+            exit 1
+          fi
+          sha256sum "${ARCHIVES[@]}" > "sentinel-${TAG}-checksums.txt"
+          cat "sentinel-${TAG}-checksums.txt"
+          # Exercise runs (workflow_dispatch without a v* tag) land as
+          # prereleases so a test never becomes the "latest" release.
+          PRE=""
+          case "$TAG" in
+            v*) ;;
+            *) PRE="--prerelease" ;;
+          esac
+          # shellcheck disable=SC2086
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            --target "$GITHUB_SHA" \
+            $PRE \
+            "${ARCHIVES[@]}" "sentinel-${TAG}-checksums.txt"
