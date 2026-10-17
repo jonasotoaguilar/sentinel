@@ -52,6 +52,9 @@ sentinel scan --explain
 
 # Offline: cache only, warns/skips when advisory data is unavailable
 sentinel scan --offline
+
+# Shell completions (bash, zsh, fish, powershell, elvish)
+eval "$(sentinel completions bash)"
 ```
 
 These examples describe the planned interface only. They will not run until the MVP is built.

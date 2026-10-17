@@ -1,10 +1,12 @@
-//! Command-line surface: exactly one command, `sentinel scan`.
+//! Command-line surface: exactly two commands, `sentinel scan` and
+//! `sentinel completions <shell>`.
 //!
 //! clap owns parsing; every rejected invocation is a usage error (stderr
 //! diagnostics, empty stdout, exit 2). `--ci`, `--offline`, `--output`,
 //! `--report`, and the advisory-only `--explain` are the only supported
-//! options; anything else is rejected, so positional arguments and unknown
-//! flags cannot silently become no-ops.
+//! scan options; anything else is rejected, so positional arguments and
+//! unknown flags cannot silently become no-ops. `completions` accepts only
+//! the shells clap_complete generates for this crate.
 
 use std::path::PathBuf;
 
@@ -24,9 +26,18 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// The single MVP command (cli-scan spec: command surface).
+/// The two MVP commands (cli-scan spec: command surface).
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Print the shell completion script for `<shell>` to stdout.
+    ///
+    /// A pure side command: no discovery, no scan, no network, no cache,
+    /// so it works outside a Git repository.
+    Completions {
+        /// Shell to generate the completion script for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     /// Scan the current Git repository for secrets.
     Scan {
         /// Run with hermetic (CI) ignore sources: parent, global, and
@@ -138,5 +149,26 @@ mod tests {
     fn missing_subcommand_is_a_usage_error() {
         let err = parse(&[]).unwrap_err();
         assert!(err.use_stderr());
+    }
+    #[test]
+    fn completions_accepts_each_supported_shell() {
+        for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+            let cli = parse(&args(&["completions", shell])).unwrap();
+            assert!(
+                matches!(cli.command, Command::Completions { .. }),
+                "shell {shell}"
+            );
+        }
+    }
+    #[test]
+    fn completions_rejects_other_shells_and_a_missing_shell() {
+        for tokens in [
+            &["completions", "tcsh"][..],
+            &["completions", "nushell"][..],
+            &["completions"][..],
+        ] {
+            let err = parse(&args(tokens)).unwrap_err();
+            assert!(err.use_stderr(), "{tokens:?}");
+        }
     }
 }
