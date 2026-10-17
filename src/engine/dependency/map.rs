@@ -84,10 +84,13 @@ mod tests {
         }
     }
     #[test]
-    fn all() {
+    fn fingerprint_is_stable_and_names_pin_location() {
         let a = fingerprint(&pl(), "GHSA-abc");
         assert_eq!(a, fingerprint(&pl(), "GHSA-abc"));
         assert!(a.starts_with("dependency/OSV-GHSA-abc/package-lock.json:1:1/"));
+    }
+    #[test]
+    fn cvss_score_maps_to_severity_with_high_default() {
         let f1 = to_finding(&pl(), "GHSA-123", "v", Some(9.8));
         let f2 = to_finding(&pf(), "PYSEC-456", "v", None);
         assert_eq!(f1.engine, "dependency");
@@ -97,7 +100,13 @@ mod tests {
             to_finding(&pl(), "A", "s", Some(5.0)).severity,
             Severity::Medium
         );
+    }
+    #[test]
+    fn engine_name_is_dependency() {
         assert_eq!(crate::engine::ENGINE_DEPENDENCY, "dependency");
+    }
+    #[test]
+    fn evidence_truncates_on_char_boundary() {
         assert!(
             to_finding(&pl(), "GHSA-x", &"a".repeat(5000), None)
                 .evidence

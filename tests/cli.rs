@@ -11,18 +11,17 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::ExitCode;
 use std::time::UNIX_EPOCH;
 
 use assert_cmd::Command as AssertCommand;
+use regex::Regex;
 use tempfile::TempDir;
 
 use sentinel::run as scan_seam;
 
-/// The two named synthetic values the fixture corpus may contain. The audit
-/// test below fails on any other secret-like token (task 4.1).
-const AWS_KEY: &str = "AKIASYNTHETICKEY1234";
-const TOKEN: &str = "sk-synthetic-1234567890";
+mod common;
+use common::{AWS_KEY, TOKEN, git, temp_repo, text_of};
 
 // ---------------------------------------------------------------------------
 // Fixture and repository helpers
@@ -37,34 +36,6 @@ fn fixture_root() -> PathBuf {
 fn fixture_bytes(rel: &str) -> Vec<u8> {
     std::fs::read(fixture_root().join(rel))
         .unwrap_or_else(|error| panic!("cannot read fixture {rel}: {error}"))
-}
-
-/// Runs git inside `cwd` with a hermetic config environment (no system/global
-/// config, no user home), mirroring the unit-test helper.
-fn git<I, S>(cwd: &Path, args: I)
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("HOME", cwd)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success(), "git failed in {cwd:?}");
-}
-
-/// Creates an empty temp git repository (initialized, no commits).
-fn temp_repo() -> (TempDir, PathBuf) {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_path_buf();
-    git(&root, ["init", "-q"]);
-    (dir, root)
 }
 
 /// Writes bytes into the repository and stages them as a tracked file.
@@ -116,10 +87,6 @@ fn scan_seam_in(args: &[&str], cwd: &Path) -> (ExitCode, Vec<u8>, Vec<u8>) {
         stdout,
         stderr,
     )
-}
-
-fn text_of(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// Recursively lists files under `root`, sorted for deterministic traversal.
@@ -573,13 +540,44 @@ fn repeated_json_runs_are_byte_identical() {
 
 // ---------------------------------------------------------------------------
 // Fixture corpus audit (task 4.1; secrets-detection "Fixture corpus is
-// synthetic"): every committed fixture carries the synthetic banner and may
-// contain only the two named synthetic tokens; any other secret-like value
-// fails loudly with the offending file and token.
+// synthetic"): every committed fixture carries the synthetic banner and every
+// value the engine reports in the fixtures is a declared synthetic one;
+// anything the shapes flag that is not declared fails loudly with the
+// offending file and line.
 // ---------------------------------------------------------------------------
+
+/// The secret shapes the audit detects, mirroring the engine's own table
+/// (`RULE_SPECS` in `src/engine/secrets.rs`): full matches with word
+/// boundaries, not prefix substrings. The table is a parameter (rather than
+/// a second hardcoded pair) so a new shape flows through the same audit
+/// without touching its logic; the corpus audit passes the production pair.
+fn secret_shapes() -> Vec<Regex> {
+    vec![
+        Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap(),
+        Regex::new(r"\bsk-synthetic-[0-9]{10}\b").unwrap(),
+    ]
+}
+
+/// Fails when `line` carries a detected shape that is not byte-identical
+/// to a declared synthetic value. Every match must be allowlisted, so a
+/// declared value beside an undeclared one still fails.
+fn check_fixture_line(shapes: &[Regex], path: &Path, line: &str) -> Result<(), String> {
+    for shape in shapes {
+        for hit in shape.find_iter(line) {
+            if ![AWS_KEY, TOKEN].contains(&hit.as_str()) {
+                return Err(format!(
+                    "{}: undeclared secret shape: {line:?}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 
 #[test]
 fn fixture_corpus_is_synthetic_only() {
+    let shapes = secret_shapes();
     let mut audited = 0;
     for path in walk_files(&fixture_root()) {
         // The pinned SARIF schema is not a secret-detection corpus file.
@@ -599,19 +597,8 @@ fn fixture_corpus_is_synthetic_only() {
                 "{}: private-key material is not synthetic: {line:?}",
                 path.display()
             );
-            if line.contains("AKIA") {
-                assert!(
-                    line.contains(AWS_KEY),
-                    "{}: non-synthetic AWS key shape: {line:?}",
-                    path.display()
-                );
-            }
-            if line.contains("sk-") {
-                assert!(
-                    line.contains(TOKEN),
-                    "{}: non-synthetic token shape: {line:?}",
-                    path.display()
-                );
+            if let Err(reason) = check_fixture_line(&shapes, &path, line) {
+                panic!("{reason}");
             }
         }
     }
@@ -619,6 +606,28 @@ fn fixture_corpus_is_synthetic_only() {
         audited >= 4,
         "fixture corpus is unexpectedly small ({audited} files)"
     );
+}
+
+#[test]
+fn fixture_audit_rejects_shape_outside_declared_prefixes() {
+    // The previous audit only inspected lines containing `AKIA` or `sk-`.
+    let line = "deploy_token = \"ghp-000000000000000000000000000000000000\"";
+    assert!(!line.contains("AKIA") && !line.contains("sk-"));
+    assert!(check_fixture_line(&secret_shapes(), Path::new("t"), line).is_ok());
+    // Once a shape joins the table, the same audit catches it with no logic change.
+    let mut shapes = secret_shapes();
+    shapes.push(Regex::new(r"\bghp-[A-Za-z0-9]{36}\b").unwrap());
+    let err = check_fixture_line(&shapes, Path::new("t"), line).unwrap_err();
+    assert!(err.contains("undeclared secret shape"), "{err}");
+    for allowed in [
+        format!("aws_key = \"{AWS_KEY}\""),
+        format!("token = {TOKEN}"),
+    ] {
+        assert!(
+            check_fixture_line(&shapes, Path::new("t"), &allowed).is_ok(),
+            "{allowed}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

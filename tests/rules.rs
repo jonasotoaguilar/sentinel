@@ -5,14 +5,13 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use assert_cmd::Command as AssertCommand;
 use tempfile::TempDir;
 
-/// The synthetic token the secret fixture embeds; it must never appear in
-/// any output stream or report file.
-const TOKEN: &str = "sk-synthetic-1234567890";
+mod common;
+
+use common::{AWS_KEY, TOKEN, git, temp_repo, text_of};
 
 fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -24,31 +23,6 @@ fn fixture_root() -> PathBuf {
 fn fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(fixture_root().join(name))
         .unwrap_or_else(|error| panic!("cannot read fixture {name}: {error}"))
-}
-
-fn git<I, S>(cwd: &Path, args: I)
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("HOME", cwd)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success(), "git failed in {cwd:?}");
-}
-
-fn temp_repo() -> (TempDir, PathBuf) {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_path_buf();
-    git(&root, ["init", "-q"]);
-    (dir, root)
 }
 
 fn track_fixture(root: &Path, fixture: &str, repo_rel: &str) {
@@ -82,7 +56,7 @@ fn violating_js_ts_and_py_report_pinned_ids_and_exit_one() {
     let (_dir, root) = violating_repo();
     let output = scan_bin(&root).output().unwrap();
     assert_eq!(output.status.code(), Some(1));
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stdout = text_of(&output.stdout);
     for id in [
         "RULE-weak-hash",
         "RULE-dynamic-code",
@@ -113,7 +87,7 @@ fn unparseable_fixture_warns_once_and_reports_nothing() {
     // diagnostic is what keeps it from being silently dropped.
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
-    let stderr = String::from_utf8(output.stderr).unwrap();
+    let stderr = text_of(&output.stderr);
     assert_eq!(
         stderr.matches("rule-fallback").count(),
         1,
@@ -144,15 +118,25 @@ fn two_json_runs_are_byte_identical() {
 fn matched_secret_never_leaves_the_engine_boundary() {
     let (_dir, root) = temp_repo();
     track_fixture(&root, "secret.js", "secret.js");
+    // The second declared synthetic enters through a tracked file of its own,
+    // so the redaction assertions below are live for both shapes, not vacuous.
+    std::fs::write(
+        root.join("aws_key.js"),
+        format!("// SYNTHETIC FIXTURE\nconst key = \"{AWS_KEY}\";\n"),
+    )
+    .unwrap();
+    git(&root, ["add", "--", "aws_key.js"]);
     let plain = scan_bin(&root).output().unwrap();
     assert_eq!(plain.status.code(), Some(1));
-    let stdout = String::from_utf8(plain.stdout).unwrap();
+    let stdout = text_of(&plain.stdout);
     assert!(
         stdout.contains("RULE-shell-injection"),
         "stdout: {stdout:?}"
     );
     assert!(!stdout.contains(TOKEN), "stdout: {stdout:?}");
-    assert!(!String::from_utf8(plain.stderr).unwrap().contains(TOKEN));
+    assert!(!stdout.contains(AWS_KEY), "stdout: {stdout:?}");
+    assert!(!text_of(&plain.stderr).contains(TOKEN));
+    assert!(!text_of(&plain.stderr).contains(AWS_KEY));
     let output = scan_bin(&root)
         .arg("--output")
         .arg("json")
@@ -162,12 +146,13 @@ fn matched_secret_never_leaves_the_engine_boundary() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty(), "stdout stays empty with --report");
-    let stderr = String::from_utf8(output.stderr).unwrap();
+    let stderr = text_of(&output.stderr);
     assert!(!stderr.contains(TOKEN), "stderr: {stderr:?}");
-    let report = String::from_utf8(std::fs::read(root.join("report.json")).unwrap()).unwrap();
+    let report = text_of(&std::fs::read(root.join("report.json")).unwrap());
     assert!(
         report.contains("RULE-shell-injection"),
         "report: {report:?}"
     );
     assert!(!report.contains(TOKEN));
+    assert!(!report.contains(AWS_KEY));
 }

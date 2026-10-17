@@ -10,7 +10,7 @@ use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::Output;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -19,8 +19,8 @@ use std::sync::{
 use assert_cmd::Command as AssertCommand;
 use tempfile::TempDir;
 
-const AWS_KEY: &str = "AKIASYNTHETICKEY1234";
-const TOKEN: &str = "sk-synthetic-1234567890";
+mod common;
+use common::{AWS_KEY, TOKEN, git, temp_repo, text_of};
 
 /// Recorded traffic of one stub endpoint: its URL, explain-request bodies,
 /// and the explain-request count (the single-attempt evidence). Only
@@ -126,31 +126,8 @@ fn echo_advisories(body: &[u8]) -> String {
     serde_json::Value::Array(out).to_string()
 }
 
-fn git<I, S>(cwd: &Path, args: I)
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("HOME", cwd)
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status()
-        .unwrap();
-    assert!(status.success(), "git failed in {cwd:?}");
-}
-
-fn temp_repo() -> (TempDir, PathBuf) {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().to_path_buf();
-    git(&root, ["init", "-q"]);
-    (dir, root)
-}
-
+/// Writes bytes into the repository and stages them as a tracked file (`&str`
+/// form: this target only stages flat names).
 fn write_tracked(root: &Path, name: &str, contents: &[u8]) {
     std::fs::write(root.join(name), contents).unwrap();
     git(
@@ -214,10 +191,6 @@ fn scan_explained_with_env(
     }
     cmd.args(args);
     cmd.output().unwrap()
-}
-
-fn text_of(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
 }
 
 fn advice_lines(stdout: &[u8]) -> Vec<String> {
