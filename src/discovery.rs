@@ -349,6 +349,68 @@ impl Git {
     }
 }
 
+/// Bounded read tying the scanned bytes to the opened inode. `File::open`
+/// follows a swapped-in symlink, so the metadata below is taken from the
+/// handle actually read: a path swapped afterwards cannot change what was
+/// validated. The read is capped at one byte past the limit, so an oversized
+/// file costs at most the cap plus one byte. The `>=` boundary matches the
+/// [`MAX_SCAN_FILE_BYTES`] handling in discovery and `parse`.
+pub(crate) enum BoundedReadError {
+    TooLarge(u64),
+    Io(std::io::Error),
+}
+
+pub(crate) fn read_scan_bytes(path: &Path) -> Result<Vec<u8>, BoundedReadError> {
+    use std::fs::File;
+    use std::io::Read as _;
+
+    let file = File::open(path).map_err(BoundedReadError::Io)?;
+    let handle = file.metadata().map_err(BoundedReadError::Io)?;
+    if !handle.file_type().is_file() {
+        return Err(BoundedReadError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a regular file",
+        )));
+    }
+    if handle.len() >= MAX_SCAN_FILE_BYTES {
+        return Err(BoundedReadError::TooLarge(handle.len()));
+    }
+    #[cfg(unix)]
+    let handle_id = {
+        use std::os::unix::fs::MetadataExt;
+        (handle.dev(), handle.ino())
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_SCAN_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(BoundedReadError::Io)?;
+    if bytes.len() as u64 >= MAX_SCAN_FILE_BYTES {
+        return Err(BoundedReadError::TooLarge(bytes.len() as u64));
+    }
+    // The path is re-stat'ed after the read: a symlink leaves `lstat`
+    // marked while `stat` follows it, so a stable link is refused outright
+    // and a path swapped mid-read fails the identity check on the handle.
+    let lstat = fs::symlink_metadata(path).map_err(BoundedReadError::Io)?;
+    if lstat.file_type().is_symlink() {
+        return Err(BoundedReadError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "path is a symlink; refusing to follow",
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let current = fs::metadata(path).map_err(BoundedReadError::Io)?;
+        if (current.dev(), current.ino()) != handle_id {
+            return Err(BoundedReadError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file replaced between open and read",
+            )));
+        }
+    }
+    Ok(bytes)
+}
+
 /// Best-effort path from a walker error; `ignore` 0.4 exposes it only via
 /// the `WithPath` variant, so the wrappers are peeled deterministically.
 fn walk_error_path(error: &ignore::Error) -> Option<&Path> {
@@ -892,5 +954,55 @@ mod tests {
                 .collect()
         });
         assert_eq!(results[0], results[1]);
+    }
+
+    #[test]
+    fn bounded_read_refuses_file_grown_past_cap() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("grown.bin");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(super::MAX_SCAN_FILE_BYTES + 1)
+            .unwrap();
+        match super::read_scan_bytes(&path) {
+            Err(super::BoundedReadError::TooLarge(len)) => {
+                assert!(len >= super::MAX_SCAN_FILE_BYTES, "len: {len}")
+            }
+            Err(super::BoundedReadError::Io(_)) => {
+                panic!("grown file must report TooLarge, not an I/O error")
+            }
+            Ok(_) => panic!("grown file must be refused, not read"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_read_refuses_symlink_out_of_tree() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, b"secret").unwrap();
+        let link = dir.path().join("link.txt");
+        symlink(&outside, &link).unwrap();
+        match super::read_scan_bytes(&link) {
+            Err(super::BoundedReadError::Io(_)) => {}
+            Err(super::BoundedReadError::TooLarge(_)) => {
+                panic!("symlink must be refused as I/O, not reported as oversized")
+            }
+            Ok(_) => panic!("symlink must be refused, not followed"),
+        }
+    }
+
+    #[test]
+    fn bounded_read_reports_missing_file() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("gone.txt");
+        match super::read_scan_bytes(&missing) {
+            Err(super::BoundedReadError::Io(_)) => {}
+            Err(super::BoundedReadError::TooLarge(_)) => {
+                panic!("missing file must report I/O, not oversize")
+            }
+            Ok(_) => panic!("missing file must report an I/O error"),
+        }
     }
 }

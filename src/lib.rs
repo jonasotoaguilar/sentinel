@@ -146,10 +146,31 @@ pub fn run_with_deps(
             // terminal output, so a secret in a file or directory name is
             // redacted with the production table while the path stays
             // readable; the finding digest never covers the path.
-            let path_text =
-                SecretsEngine::redact_production(&path.to_string_lossy().replace('\\', "/"));
-            let bytes = std::fs::read(root.join(path))
-                .map_err(|error| Diagnostic::read_failed(&path_text, &error))?;
+            let raw = path.to_string_lossy().replace('\\', "/");
+            let path_text = SecretsEngine::redact_production(&raw);
+            let bytes = match discovery::read_scan_bytes(&root.join(path)) {
+                Ok(bytes) => bytes,
+                Err(discovery::BoundedReadError::TooLarge(len)) => {
+                    return Err(Diagnostic {
+                        code: "skipped-large",
+                        path: path_text,
+                        rule: String::new(),
+                        message: format!("{len} bytes exceeds the 10 MiB scan limit"),
+                    });
+                }
+                Err(discovery::BoundedReadError::Io(error)) => {
+                    return Err(Diagnostic::read_failed(&path_text, &error));
+                }
+            };
+            // Manifest bytes travel with the scan, so the dependency review
+            // below parses these same bytes instead of opening each file
+            // a second time.
+            let shared = if raw.ends_with("package-lock.json") || raw.ends_with("requirements.txt")
+            {
+                Some((raw, bytes.clone()))
+            } else {
+                None
+            };
             let (rule_candidates, rule_diagnostics) =
                 rules_engine.scan_with_diagnostics(&path_text, &bytes);
             Ok((
@@ -157,15 +178,20 @@ pub fn run_with_deps(
                 engine.scan(&bytes),
                 rule_candidates,
                 rule_diagnostics,
+                shared,
             ))
         })
         .collect::<Vec<_>>();
 
     let mut findings = Vec::new();
+    let mut manifests: Vec<(String, Vec<u8>)> = Vec::new();
     for scan in scans {
         match scan {
-            Ok((path, secret_candidates, rule_candidates, rule_diagnostics)) => {
+            Ok((path, secret_candidates, rule_candidates, rule_diagnostics, shared)) => {
                 diagnostics.extend(rule_diagnostics);
+                if let Some(entry) = shared {
+                    manifests.push(entry);
+                }
                 findings.extend(normalize::to_findings(&path, secret_candidates));
                 findings.extend(normalize::to_findings_for(
                     crate::engine::ENGINE_RULES,
@@ -202,7 +228,7 @@ pub fn run_with_deps(
     // these findings can no longer carry a raw value, and neither can
     // advisory text keyed by finding id. Digests and dedupe keys are
     // computed from pre-display values inside the engines and are untouched.
-    let (dep_findings, dep_diags) = dep_engine.review(&root, &files);
+    let (dep_findings, dep_diags) = dep_engine.review_bytes(&manifests);
     diagnostics.extend(dep_diags);
     findings.extend(dep_findings.into_iter().map(|mut finding| {
         finding.location.path = SecretsEngine::redact_production(&finding.location.path);

@@ -1,11 +1,14 @@
 pub mod map;
 pub mod parse;
 use crate::cache::XdgCache;
+#[cfg(test)]
+use crate::discovery::{BoundedReadError, read_scan_bytes};
 use crate::finding::{Diagnostic, Finding, Severity};
 use crate::osv::client::{NETWORK_BUDGET, OsvApi, Query};
 use crate::osv::validate;
 #[allow(unused_imports)]
 pub use parse::{Ecosystem, Pin};
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 pub enum Transport {
@@ -26,14 +29,26 @@ impl DependencyEngine {
             transport: Transport::Online(c, osv),
         }
     }
+    /// Disk-backed entry kept for the unit tests below; production scans
+    /// share the bytes they already read via [`Self::review_bytes`].
+    #[cfg(test)]
     pub fn review(&self, root: &Path, files: &[PathBuf]) -> (Vec<Finding>, Vec<Diagnostic>) {
         let mut diags = Vec::new();
         let mut pins = Vec::new();
         for rel in files {
             let p = rel.to_string_lossy().replace('\\', "/");
-            let b = match std::fs::read(root.join(rel)) {
+            let b = match read_scan_bytes(&root.join(rel)) {
                 Ok(b) => b,
-                Err(e) => {
+                Err(BoundedReadError::TooLarge(len)) => {
+                    diags.push(Diagnostic {
+                        code: "skipped-large",
+                        path: p,
+                        rule: String::new(),
+                        message: format!("{len} bytes exceeds the 10 MiB scan limit"),
+                    });
+                    continue;
+                }
+                Err(BoundedReadError::Io(e)) => {
                     diags.push(Diagnostic::read_failed(&p, &e));
                     continue;
                 }
@@ -44,10 +59,38 @@ impl DependencyEngine {
         }
         pins.sort();
         pins.dedup();
+        let (mut out, mut tail) = self.review_pins(&pins);
+        diags.append(&mut tail);
+        out.sort();
+        diags.sort();
+        (out, diags)
+    }
+    /// Reviews manifest bytes the caller already read, so secrets findings
+    /// and dependency pins can never come from two different byte streams.
+    pub fn review_bytes(&self, entries: &[(String, Vec<u8>)]) -> (Vec<Finding>, Vec<Diagnostic>) {
+        let mut diags = Vec::new();
+        let mut pins = Vec::new();
+        for (p, b) in entries {
+            let (mut pp, mut dd) = parse::parse_file(p, b);
+            pins.append(&mut pp);
+            diags.append(&mut dd);
+        }
+        pins.sort();
+        pins.dedup();
+        let (mut out, mut tail) = self.review_pins(&pins);
+        diags.append(&mut tail);
+        out.sort();
+        diags.sort();
+        (out, diags)
+    }
+    /// Shared pin-to-finding tail: cache, OSV budget, and degradation are
+    /// identical whether the bytes came from disk or from the caller.
+    fn review_pins(&self, pins: &[Pin]) -> (Vec<Finding>, Vec<Diagnostic>) {
+        let mut diags = Vec::new();
         let mut out = Vec::new();
         match &self.transport {
             Transport::Offline(cache) => {
-                for pin in &pins {
+                for pin in pins {
                     let hit = cache.as_ref().and_then(|c| {
                         c.get_offline(pin.ecosystem.as_str(), &pin.name, &pin.version)
                     });
@@ -73,7 +116,7 @@ impl DependencyEngine {
             }
             Transport::Online(cache, osv) => {
                 let mut pending = Vec::new();
-                for pin in &pins {
+                for pin in pins {
                     let hit = cache
                         .as_ref()
                         .and_then(|c| c.get(pin.ecosystem.as_str(), &pin.name, &pin.version));
@@ -176,7 +219,6 @@ impl DependencyEngine {
             }
         }
         out.sort();
-        diags.sort();
         (out, diags)
     }
 }
@@ -622,5 +664,26 @@ mod tests {
         assert!(findings.is_empty());
         assert!(diags.iter().any(|d| d.code == "osv-unavailable"));
         assert!(!diags.iter().any(|d| d.code == "cache-entry-corrupt"));
+    }
+    #[test]
+    fn review_bytes_uses_supplied_bytes_without_touching_disk() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = XdgCache::with_root(cache_dir.path().to_path_buf());
+        cache
+            .put(
+                "npm",
+                "lodash",
+                "4.17.20",
+                &serde_json::to_vec(&serde_json::json!({"id":"GHSA-1234","summary":"t","severity":[{"type":"CVSS_V3","score":"9.8"}]})).unwrap(),
+            )
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        assert!(!root.path().join("package-lock.json").exists());
+        let body = br#"{"packages":{"node_modules/lodash":{"version":"4.17.20"}}}"#.to_vec();
+        let (findings, diags) = DependencyEngine::offline(Some(cache))
+            .review_bytes(&[(String::from("package-lock.json"), body)]);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].rule_id, "OSV-GHSA-1234");
     }
 }
