@@ -19,7 +19,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::CommandFactory;
+use clap::{CommandFactory, error::ErrorKind};
 use rayon::prelude::*;
 
 use cli::{Command, OutputFormat};
@@ -182,6 +182,15 @@ pub(crate) fn run_with_dep_client(
     let cli = match cli::parse(args) {
         Ok(cli) => cli,
         Err(usage) => {
+            // `--help`/`--version` are display requests, not usage errors:
+            // their text goes to stdout and the process exits 0.
+            if matches!(
+                usage.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                let _ = write!(stdout, "{}", usage.render());
+                return ExitCode::SUCCESS;
+            }
             // Usage errors echo the rejected argument, which may be a path.
             let _ = write!(
                 stderr,
@@ -637,11 +646,10 @@ mod tests {
 
     #[test]
     fn unsupported_flag_writes_usage_to_stderr_and_exits_two() {
-        for args in [
-            &["scan", "file.txt"][..],
-            &["scan", "--help"],
-            &["scan", "--version"],
-        ] {
+        // `--help`/`--version` intentionally excluded: they render to stdout
+        // and exit 0 (covered below), so only genuinely unknown input stays
+        // a usage error.
+        for args in [&["scan", "file.txt"][..], &["scan", "--nope"][..]] {
             let (code, out, err) = run_scan(args, Path::new("."));
             assert_eq!(code, ExitCode::from(2), "args {args:?}");
             assert!(out.is_empty(), "stdout must stay empty for {args:?}");
@@ -652,6 +660,44 @@ mod tests {
                 "args {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn help_and_version_write_to_stdout_and_exit_zero() {
+        // Pins the S2 crate rename (`sentinel-scan`) against the binary users
+        // type (`sentinel`): help/version output must never show the crate name.
+        let version = format!("sentinel {}", env!("CARGO_PKG_VERSION"));
+        for args in [
+            &["--help"][..],
+            &["--version"][..],
+            &["scan", "--help"][..],
+            &["completions", "--help"][..],
+        ] {
+            let (code, out, err) = run_scan(args, Path::new("."));
+            assert_eq!(code, ExitCode::SUCCESS, "args {args:?}");
+            let text = String::from_utf8(out).unwrap();
+            assert!(
+                !text.is_empty(),
+                "args {args:?}: stdout must carry the text"
+            );
+            assert!(!text.contains("sentinel-scan"), "args {args:?}: {text:?}");
+            assert!(err.is_empty(), "args {args:?}: stderr must stay empty");
+        }
+        let (_, out, _) = run_scan(&["--version"], Path::new("."));
+        assert!(
+            String::from_utf8(out).unwrap().starts_with(&version),
+            "version must start with {version:?}"
+        );
+        let (_, out, _) = run_scan(&["--help"], Path::new("."));
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("scan"),
+            "help must list subcommands: {text:?}"
+        );
+        assert!(
+            text.contains("completions"),
+            "help must list subcommands: {text:?}"
+        );
     }
 
     use crate::explain::{Explanation, StubExplainer};
