@@ -1,0 +1,267 @@
+name: 'Sentinel scan'
+description: >-
+  Download a verified Sentinel release, scan the workspace with
+  `sentinel scan --ci --output sarif`, upload the SARIF report to GitHub code
+  scanning, and map the exit policy (0 clean, 1 findings, 2 scan did not run).
+
+inputs:
+  version:
+    description: >-
+      Sentinel release tag to scan with (for example 'v0.2.0'), or 'latest' to
+      resolve the newest release through the GitHub API on
+      jonasotoaguilar/sentinel.
+    required: false
+    default: 'latest'
+  fail-on-findings:
+    description: >-
+      Fail the workflow when the scan reports findings (sentinel exit 1).
+      When 'false', findings are still reported and uploaded, but the job
+      passes. A scan that did not run (exit 2) always fails.
+    required: false
+    default: 'true'
+  upload-sarif:
+    description: >-
+      Upload the SARIF report to GitHub code scanning. Requires the
+      `security-events: write` permission on the calling job.
+    required: false
+    default: 'true'
+
+outputs:
+  sarif-file:
+    description: 'Absolute path of the SARIF report written by the scan.'
+    value: ${{ steps.scan.outputs.sarif-file }}
+  exit-code:
+    description: 'Raw sentinel exit code: 0 clean, 1 findings reported, 2 scan did not run.'
+    value: ${{ steps.scan.outputs.exit-code }}
+  findings-count:
+    description: 'Number of results in the SARIF report (0 when the scan did not run).'
+    value: ${{ steps.scan.outputs.findings-count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: install
+      name: 'Install verified Sentinel release'
+      shell: bash
+      env:
+        SENTINEL_INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        REPO='jonasotoaguilar/sentinel'
+        INSTALL_DIR="${RUNNER_TEMP}/sentinel-action"
+        mkdir -p "$INSTALL_DIR"
+        cd "$INSTALL_DIR"
+
+        # 1. Resolve the release tag: 'latest' goes through the GitHub API
+        # against this repository's releases; anything else is a tag verbatim.
+        # Release tags carry the 'v' prefix, so '0.2.0' and 'v0.2.0' must both
+        # work: a version that is not 'latest' and lacks the prefix gets it,
+        # rather than building a download URL that cannot exist.
+        case "$SENTINEL_INPUT_VERSION" in
+          latest|v*) ;;
+          *) SENTINEL_INPUT_VERSION="v${SENTINEL_INPUT_VERSION}" ;;
+        esac
+
+        if [ "$SENTINEL_INPUT_VERSION" = "latest" ]; then
+          API_URL="${GITHUB_API_URL:-https://api.github.com}/repos/${REPO}/releases/latest"
+          AUTH_ARGS=()
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            AUTH_ARGS=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+          fi
+          if ! API_RESPONSE="$(curl -fsSL "${AUTH_ARGS[@]}" -H 'Accept: application/vnd.github+json' "$API_URL")"; then
+            echo "::error::could not resolve the latest Sentinel release from ${API_URL}. Check network access and API rate limits, or pin 'version' to a tag such as 'v0.2.0'."
+            exit 1
+          fi
+          if command -v python3 >/dev/null 2>&1; then
+            TAG="$(printf '%s' "$API_RESPONSE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
+          else
+            TAG="$(printf '%s' "$API_RESPONSE" | grep -o '"tag_name": *"[^"]*"' | head -n 1 | cut -d'"' -f4)"
+          fi
+          if [ -z "${TAG:-}" ]; then
+            echo "::error::the GitHub API response did not contain a release tag_name."
+            exit 1
+          fi
+          echo "Resolved version 'latest' to Sentinel release '${TAG}'."
+        else
+          TAG="$SENTINEL_INPUT_VERSION"
+          echo "Using requested Sentinel release '${TAG}'."
+        fi
+
+        # 2. Detect the runner platform. Only shipped triples are accepted;
+        # anything else fails with a clear message rather than guessing.
+        TRIPLE=''
+        EXT=''
+        BIN='sentinel'
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64) TRIPLE='x86_64-unknown-linux-gnu'; EXT='tar.gz' ;;
+          macOS-ARM64) TRIPLE='aarch64-apple-darwin'; EXT='tar.gz' ;;
+          Windows-X64) TRIPLE='x86_64-pc-windows-msvc'; EXT='zip'; BIN='sentinel.exe' ;;
+          *)
+            echo "::error::unsupported runner '${RUNNER_OS}-${RUNNER_ARCH}': Sentinel ships x86_64-unknown-linux-gnu (Linux X64), aarch64-apple-darwin (macOS ARM64), and x86_64-pc-windows-msvc (Windows X64)."
+            exit 1
+            ;;
+        esac
+
+        # 3. Download the release archive and its checksums file.
+        ASSET="sentinel-${TAG}-${TRIPLE}.${EXT}"
+        CHECKSUMS="sentinel-${TAG}-checksums.txt"
+        BASE="https://github.com/${REPO}/releases/download/${TAG}"
+        if ! curl -fsSL -o "$ASSET" "${BASE}/${ASSET}"; then
+          echo "::error::could not download ${BASE}/${ASSET}. Check that release '${TAG}' exists and ships an asset for '${TRIPLE}'."
+          exit 1
+        fi
+        if ! curl -fsSL -o "$CHECKSUMS" "${BASE}/${CHECKSUMS}"; then
+          echo "::error::could not download ${BASE}/${CHECKSUMS}. The release ships one checksums file covering every archive."
+          exit 1
+        fi
+
+        # 4. Verify the archive against the release checksums file before
+        # running anything. sha256sum, shasum, and python3 are tried in that
+        # order because no single one exists on every runner OS.
+        EXPECTED="$(grep -F " ${ASSET}" "$CHECKSUMS" | awk '{print $1}' || true)"
+        if [ -z "$EXPECTED" ]; then
+          echo "::error::no checksum entry for '${ASSET}' in '${CHECKSUMS}'."
+          exit 1
+        fi
+        if command -v sha256sum >/dev/null 2>&1; then
+          printf '%s  %s\n' "$EXPECTED" "$ASSET" | sha256sum -c -
+        elif command -v shasum >/dev/null 2>&1; then
+          printf '%s  %s\n' "$EXPECTED" "$ASSET" | shasum -a 256 -c -
+        elif command -v python3 >/dev/null 2>&1; then
+          # No heredoc here: inside a YAML literal block the terminator
+          # would keep its indentation and bash would never find it.
+          ACTUAL="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$ASSET")"
+          if [ "$ACTUAL" = "$EXPECTED" ]; then
+            echo "${ASSET}: OK"
+          else
+            echo "::error::checksum mismatch for '${ASSET}': expected '${EXPECTED}', got '${ACTUAL}'."
+            exit 1
+          fi
+        else
+          echo "::error::cannot verify checksums: neither sha256sum, shasum, nor python3 is available on this runner."
+          exit 1
+        fi
+
+        # 5. Verify the build-provenance attestation when gh can do it. A
+        # missing gh, a gh older than 2.49 (which introduced attestation
+        # commands), and an unknown 'attestation' subcommand all degrade to
+        # the same warning: the checksum above already verified the bytes,
+        # but the provenance could not be confirmed. A failed verification on
+        # a capable gh fails the step: the download is not trusted.
+        ATTESTATION_WARNING='gh attestation verification was skipped: gh is missing, older than 2.49, or has no attestation support on this runner. The archive checksum was still verified above.'
+        if ! command -v gh >/dev/null 2>&1; then
+          echo "::warning::${ATTESTATION_WARNING}"
+        else
+          GH_VERSION="$(gh --version 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)"
+          GH_MAJOR="$(printf '%s' "$GH_VERSION" | cut -d. -f1)"
+          GH_MINOR="$(printf '%s' "$GH_VERSION" | cut -d. -f2)"
+          if [ -z "$GH_MAJOR" ] || [ -z "$GH_MINOR" ] || [ "$GH_MAJOR" -lt 2 ] || { [ "$GH_MAJOR" -eq 2 ] && [ "$GH_MINOR" -lt 49 ]; }; then
+            echo "::warning::${ATTESTATION_WARNING} (gh version: ${GH_VERSION:-unknown})"
+          elif ! gh attestation verify --help >/dev/null 2>&1; then
+            echo "::warning::${ATTESTATION_WARNING}"
+          elif ! gh attestation verify "$ASSET" --owner jonasotoaguilar; then
+            echo "::error::build-provenance attestation verification failed for '${ASSET}'. The archive is not trusted; refusing to run it."
+            exit 1
+          else
+            echo "Build-provenance attestation verified for '${ASSET}'."
+          fi
+        fi
+
+        # 6. Extract the binary and expose it to the later steps.
+        EXTRACT_DIR="${INSTALL_DIR}/bin"
+        mkdir -p "$EXTRACT_DIR"
+        if [ "$EXT" = "zip" ]; then
+          if command -v unzip >/dev/null 2>&1; then
+            unzip -o -q "$ASSET" -d "$EXTRACT_DIR"
+          else
+            tar -xf "$ASSET" -C "$EXTRACT_DIR"
+          fi
+        else
+          tar -xzf "$ASSET" -C "$EXTRACT_DIR"
+        fi
+        chmod +x "${EXTRACT_DIR}/${BIN}"
+        if [ ! -f "${EXTRACT_DIR}/${BIN}" ]; then
+          echo "::error::the archive did not contain the expected binary '${BIN}'."
+          exit 1
+        fi
+        echo "$EXTRACT_DIR" >> "$GITHUB_PATH"
+        "${EXTRACT_DIR}/${BIN}" --version
+
+    - id: scan
+      name: 'Run Sentinel scan'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        SARIF_FILE="${RUNNER_TEMP}/sentinel-results.sarif"
+        rm -f "$SARIF_FILE"
+
+        # The scan step itself never fails: the raw exit code is recorded as
+        # an output and the policy step below decides whether the job fails.
+        set +e
+        sentinel scan --ci --output sarif --report "$SARIF_FILE" .
+        SCAN_EXIT=$?
+        set -e
+
+        echo "Sentinel scan finished with exit code ${SCAN_EXIT}."
+        echo "exit-code=${SCAN_EXIT}" >> "$GITHUB_OUTPUT"
+        echo "sarif-file=${SARIF_FILE}" >> "$GITHUB_OUTPUT"
+
+        if [ -f "$SARIF_FILE" ]; then
+          echo "sarif-exists=true" >> "$GITHUB_OUTPUT"
+          COUNT=''
+          if command -v python3 >/dev/null 2>&1; then
+            COUNT="$(python3 -c 'import json,sys; print(sum(len(r.get("results", [])) for r in json.load(open(sys.argv[1])).get("runs", [])))' "$SARIF_FILE" 2>/dev/null || true)"
+          fi
+          if [ -z "$COUNT" ] && command -v jq >/dev/null 2>&1; then
+            COUNT="$(jq '[.runs[].results | length] | add // 0' "$SARIF_FILE" 2>/dev/null || true)"
+          fi
+          if [ -z "$COUNT" ]; then
+            echo "::warning::could not count SARIF results (neither python3 nor jq parsed the report); reporting findings-count=0."
+            COUNT=0
+          fi
+          echo "findings-count=${COUNT}" >> "$GITHUB_OUTPUT"
+          echo "Sentinel reported ${COUNT} finding(s) in ${SARIF_FILE}."
+        else
+          echo "sarif-exists=false" >> "$GITHUB_OUTPUT"
+          echo "findings-count=0" >> "$GITHUB_OUTPUT"
+          echo "::warning::no SARIF report was written to ${SARIF_FILE}; the scan did not complete (exit ${SCAN_EXIT})."
+        fi
+
+    - name: 'Upload SARIF to code scanning'
+      if: inputs.upload-sarif == 'true' && steps.scan.outputs.sarif-exists == 'true'
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ steps.scan.outputs.sarif-file }}
+
+    - name: 'Apply exit policy'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        EXIT_CODE='${{ steps.scan.outputs.exit-code }}'
+        FINDINGS='${{ steps.scan.outputs.findings-count }}'
+        FAIL_ON='${{ inputs.fail-on-findings }}'
+
+        case "$FAIL_ON" in
+          true | false) ;;
+          *) echo "::warning::unexpected fail-on-findings value '${FAIL_ON}'; expected 'true' or 'false'. Treating it as 'false'."; FAIL_ON='false' ;;
+        esac
+
+        if [ "$EXIT_CODE" = "2" ]; then
+          echo "::error::Sentinel scan did not run (exit 2). Fix the scan errors logged above; no SARIF was produced."
+          exit 1
+        elif [ "$EXIT_CODE" = "1" ]; then
+          if [ "$FAIL_ON" = "true" ]; then
+            echo "::error::Sentinel reported ${FINDINGS} finding(s) (exit 1, fail-on-findings=true). See the code scanning alerts."
+            exit 1
+          else
+            echo "::warning::Sentinel reported ${FINDINGS} finding(s), but fail-on-findings=false so the job passes."
+          fi
+        elif [ "$EXIT_CODE" = "0" ]; then
+          echo "Sentinel scan is clean: no findings."
+        else
+          echo "::error::unexpected Sentinel exit code '${EXIT_CODE}' (expected 0, 1, or 2)."
+          exit 1
+        fi
