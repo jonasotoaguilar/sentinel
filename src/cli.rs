@@ -14,13 +14,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 /// Sentinel — deterministic secrets scanner for Git repositories.
 #[derive(Debug, Parser)]
-#[command(
-    name = "sentinel",
-    about,
-    disable_help_flag = true,
-    disable_version_flag = true,
-    disable_help_subcommand = true
-)]
+#[command(name = "sentinel", about, version)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -131,13 +125,52 @@ mod tests {
     }
     #[test]
     fn unsupported_arguments_are_usage_errors() {
-        for tokens in [
-            &["scan", "some-file.txt"][..],
-            &["scan", "--help"],
-            &["scan", "--version"],
-        ] {
+        // `--help`/`--version` intentionally excluded: they render and exit 0
+        // (covered below), so only genuinely unknown input stays a usage error.
+        for tokens in [&["scan", "some-file.txt"][..], &["scan", "--nope"][..]] {
             let err = parse(&args(tokens)).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{tokens:?}");
+        }
+    }
+    #[test]
+    fn help_and_version_render_with_exact_program_name() {
+        // Pins the S2 crate rename (`sentinel-scan`) against the binary users
+        // type (`sentinel`): clap takes the command name from `name`, never
+        // the crate name, and these assertions fail if that wiring regresses.
+        for tokens in [&["--help"][..], &["-h"][..]] {
+            let err = parse(&args(tokens)).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::DisplayHelp, "{tokens:?}");
+            let rendered = err.render().to_string();
+            assert!(rendered.contains("scan"), "{tokens:?}: {rendered:?}");
+            assert!(rendered.contains("completions"), "{tokens:?}: {rendered:?}");
+            assert!(
+                !rendered.contains("sentinel-scan"),
+                "{tokens:?}: {rendered:?}"
+            );
+        }
+        for tokens in [&["--version"][..], &["-V"][..]] {
+            let err = parse(&args(tokens)).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::DisplayVersion, "{tokens:?}");
+            let rendered = err.render().to_string();
+            assert!(
+                rendered.starts_with(&format!("sentinel {}", env!("CARGO_PKG_VERSION"))),
+                "{tokens:?}: {rendered:?}"
+            );
+            assert!(
+                !rendered.contains("sentinel-scan"),
+                "{tokens:?}: {rendered:?}"
+            );
+        }
+    }
+    #[test]
+    fn subcommand_help_and_version_render() {
+        for tokens in [&["scan", "--help"][..], &["completions", "--help"][..]] {
+            let err = parse(&args(tokens)).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::DisplayHelp, "{tokens:?}");
+            assert!(
+                !err.render().to_string().contains("sentinel-scan"),
+                "{tokens:?}"
+            );
         }
     }
     #[test]

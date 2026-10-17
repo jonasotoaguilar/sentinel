@@ -165,6 +165,68 @@ fn unsupported_arguments_and_missing_subcommand_write_stderr_only_and_exit_2() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// product-p0 (S3): --help/--version restored. The program name users type is
+// `sentinel`, never the `sentinel-scan` crate name, so every assertion pins
+// the exact name, not just the version number.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn version_flags_exit_zero_with_exact_program_name() {
+    let expected = format!("sentinel {}", env!("CARGO_PKG_VERSION"));
+    for args in [&["--version"][..], &["-V"][..]] {
+        let output = AssertCommand::cargo_bin("sentinel")
+            .unwrap()
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "args {args:?}");
+        let stdout = text_of(&output.stdout);
+        assert!(stdout.starts_with(&expected), "args {args:?}: {stdout:?}");
+        assert!(
+            !stdout.contains("sentinel-scan"),
+            "args {args:?}: {stdout:?}"
+        );
+    }
+}
+
+#[test]
+fn help_flags_exit_zero_with_exact_program_name() {
+    for args in [&["--help"][..], &["-h"][..]] {
+        let output = AssertCommand::cargo_bin("sentinel")
+            .unwrap()
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "args {args:?}");
+        let stdout = text_of(&output.stdout);
+        assert!(stdout.contains("scan"), "args {args:?}: {stdout:?}");
+        assert!(stdout.contains("completions"), "args {args:?}: {stdout:?}");
+        assert!(
+            !stdout.contains("sentinel-scan"),
+            "args {args:?}: {stdout:?}"
+        );
+    }
+}
+
+#[test]
+fn subcommand_help_exits_zero() {
+    for args in [&["scan", "--help"][..], &["completions", "--help"][..]] {
+        let output = AssertCommand::cargo_bin("sentinel")
+            .unwrap()
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "args {args:?}");
+        let stdout = text_of(&output.stdout);
+        assert!(!stdout.is_empty(), "args {args:?}: stdout must carry help");
+        assert!(
+            !stdout.contains("sentinel-scan"),
+            "args {args:?}: {stdout:?}"
+        );
+    }
+}
+
 #[test]
 fn binary_accepts_explain_and_degrades_to_skip_without_configuration() {
     let (_dir, root) = temp_repo();
