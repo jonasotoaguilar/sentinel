@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`sentinel scan` is the sole MVP command: a fixed pipeline (discovery → engines → normalize → render), mapped to exit codes 0/1/2. Unless `--offline`, it MAY call `api.osv.dev` and write the XDG OSV advisory cache; it MUST NOT modify the repository or emit telemetry.
+`sentinel scan` is the MVP's scanning command: a fixed pipeline (discovery → engines → normalize → render), mapped to exit codes 0/1/2. Unless `--offline`, it MAY call `api.osv.dev` and write the XDG OSV advisory cache; it MUST NOT modify the repository or emit telemetry. `sentinel completions <shell>` emits a shell completion script and touches nothing else.
 
 ## Requirements
 
