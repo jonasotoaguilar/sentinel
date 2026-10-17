@@ -6,6 +6,7 @@ mod cli;
 mod discovery;
 mod engine;
 mod errors;
+pub mod explain;
 mod finding;
 mod normalize;
 pub mod osv;
@@ -13,6 +14,7 @@ mod render;
 #[cfg(test)]
 mod test_util;
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
@@ -22,6 +24,7 @@ use rayon::prelude::*;
 use cli::{Command, OutputFormat};
 use discovery::Discovered;
 use engine::secrets::SecretsEngine;
+use explain::{DisabledExplainer, Explainer};
 use finding::Diagnostic;
 
 /// Runs the scan pipeline and returns the process exit code. Usage errors and
@@ -47,6 +50,22 @@ fn run_inner(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> ExitCode {
+    // No HTTP adapter exists in this unit, so the explainer is always
+    // disabled; PR6 builds it from the environment and calls run_with_deps.
+    run_with_deps(engine, &DisabledExplainer, args, cwd, stdout, stderr)
+}
+
+/// The pipeline over an explicit engine and explainer (tests inject the stub,
+/// so no test touches the network). The explainer runs at most once per scan:
+/// only when `--explain` was requested, allowed, and configured.
+pub fn run_with_deps(
+    engine: &SecretsEngine,
+    explainer: &dyn Explainer,
+    args: &[String],
+    cwd: &Path,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ExitCode {
     let cli = match cli::parse(args) {
         Ok(cli) => cli,
         Err(usage) => {
@@ -59,6 +78,7 @@ fn run_inner(
         offline,
         output,
         report,
+        explain,
     } = cli.command;
     let mode = if ci {
         discovery::Mode::Ci
@@ -140,11 +160,38 @@ fn run_inner(
     findings.extend(dep_findings);
     let findings = normalize::dedupe_and_sort(findings);
 
+    // Opt-in advisories: silent under `--ci`/`--offline` (byte-identical to no
+    // flag); one `explain-skipped` when unconfigured; else a single call whose
+    // text only reaches terminal output.
+    let mut advisories: BTreeMap<String, String> = BTreeMap::new();
+    if explain && !ci && !offline {
+        if explainer.is_configured() {
+            // A failed call degrades to no advisories; PR6 reports it as
+            // `explain-failed` instead of staying silent.
+            if let Ok(explanations) = explainer.explain(&findings) {
+                for explanation in explanations {
+                    if findings.iter().any(|f| f.id == explanation.finding_id) {
+                        advisories
+                            .entry(explanation.finding_id)
+                            .or_insert(explanation.text);
+                    }
+                }
+            }
+        } else {
+            diagnostics.push(Diagnostic::explain_skipped(
+                "no explain endpoint configured",
+            ));
+        }
+    }
+
     let _ = stderr.write_all(&render::render_diagnostics(&diagnostics));
 
     // Report formats render first, then write to stdout or the requested file.
     let report_bytes = match output {
-        OutputFormat::Terminal => render::render_findings(&findings),
+        // Without advisories the original renderer runs, so those bytes are
+        // identical by construction, not just by delegation.
+        OutputFormat::Terminal if advisories.is_empty() => render::render_findings(&findings),
+        OutputFormat::Terminal => render::render_findings_with_advisories(&findings, &advisories),
         OutputFormat::Json | OutputFormat::Sarif => {
             let rendered = match output {
                 OutputFormat::Json => render::render_json(&findings),
@@ -179,7 +226,7 @@ fn run_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::{run, run_inner};
+    use super::{run, run_inner, run_with_deps};
     use crate::engine::secrets::{RuleSpec, SecretsEngine};
     use crate::finding::Severity;
     use crate::test_util::{temp_repo, write_tracked, write_untracked};
@@ -356,8 +403,7 @@ mod tests {
     #[test]
     fn unsupported_flag_writes_usage_to_stderr_and_exits_two() {
         for args in [
-            &["scan", "--explain"][..],
-            &["scan", "file.txt"],
+            &["scan", "file.txt"][..],
             &["scan", "--help"],
             &["scan", "--version"],
         ] {
@@ -371,6 +417,127 @@ mod tests {
                 "args {args:?}"
             );
         }
+    }
+
+    use crate::explain::{Explanation, StubExplainer};
+
+    fn run_explained(
+        args: &[&str],
+        cwd: &Path,
+        stub: &StubExplainer,
+    ) -> (ExitCode, Vec<u8>, Vec<u8>) {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_with_deps(&SecretsEngine::new(), stub, &args, cwd, &mut out, &mut err);
+        (code, out, err)
+    }
+
+    #[test]
+    fn explain_stays_off_unless_requested_and_allowed() {
+        let (_dir, root) = secret_repo();
+        for extra in [&["scan"][..], &["scan", "--ci"], &["scan", "--offline"]] {
+            let stub = StubExplainer::per_finding("advice ");
+            let mut flagged = extra.to_vec();
+            flagged.push("--explain");
+            let explained = run_explained(&flagged, &root, &stub);
+            let plain = run_scan(extra, &root);
+            if extra.len() == 1 {
+                assert_eq!(stub.calls(), 1, "requested and allowed: one call");
+                assert_eq!((explained.0, explained.2), (plain.0, plain.2));
+            } else {
+                assert_eq!(stub.calls(), 0, "forced off under {extra:?}");
+                assert_eq!(explained, plain);
+            }
+        }
+        let stub = StubExplainer::per_finding("advice ");
+        assert_eq!(
+            run_explained(&["scan"], &root, &stub),
+            run_scan(&["scan"], &root)
+        );
+        assert_eq!(stub.calls(), 0, "off by default");
+    }
+
+    #[test]
+    fn explain_advisories_are_additive_on_terminal_only() {
+        let (_dir, root) = secret_repo();
+        let stub = StubExplainer::per_finding("advice for ");
+        let (code, out, err) = run_explained(&["scan", "--explain"], &root, &stub);
+        let (plain_code, plain_out, plain_err) = run_scan(&["scan"], &root);
+        assert_eq!(code, plain_code);
+        assert_eq!(err, plain_err);
+        let text = String::from_utf8(out).unwrap();
+        let plain = String::from_utf8(plain_out).unwrap();
+        let advice: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("  advice: "))
+            .collect();
+        assert_eq!(advice.len(), 2, "one advisory line per finding");
+        let stripped: String = text
+            .lines()
+            .filter(|line| !line.starts_with("  advice: "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(stripped, plain, "finding lines unchanged");
+    }
+
+    #[test]
+    fn explain_hostile_stub_text_is_contained() {
+        let (_dir, root) = secret_repo();
+        let prefix =
+            "first\nforged shape env.example:9:9: critical SECRET-forged: x\u{1b}[31mred\t";
+        let stub = StubExplainer::per_finding(&format!("{prefix}{}", "y".repeat(600)));
+        let (code, out, _) = run_explained(&["scan", "--explain"], &root, &stub);
+        assert_eq!(code, ExitCode::from(1));
+        let text = String::from_utf8(out).unwrap();
+        let advice: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("  advice: "))
+            .collect();
+        assert_eq!(advice.len(), 2);
+        for line in &advice {
+            assert!(!line.contains('\u{1b}'), "no escapes: {line:?}");
+            let body = line.strip_prefix("  advice: ").unwrap_or("");
+            assert_eq!(body.chars().count(), 500, "capped at exactly 500");
+        }
+        assert!(
+            text.lines()
+                .all(|line| !line.contains("SECRET-forged") || line.starts_with("  advice: ")),
+            "forged text can never stand as its own line"
+        );
+        let (_, json_out, _) =
+            run_explained(&["scan", "--explain", "--output", "json"], &root, &stub);
+        assert!(!String::from_utf8(json_out).unwrap().contains("advice:"));
+        // Unknown ids never render: the advisory map is keyed by finding id.
+        let ghost = StubExplainer::fixed(vec![Explanation {
+            finding_id: "no/such:1:1/id".to_string(),
+            text: "ghost".to_string(),
+        }]);
+        assert_eq!(
+            run_explained(&["scan", "--explain"], &root, &ghost),
+            run_scan(&["scan"], &root)
+        );
+        assert_eq!(ghost.calls(), 1);
+    }
+
+    #[test]
+    fn explain_keeps_machine_formats_and_reports_byte_identical() {
+        let (_dir, root) = secret_repo();
+        let stub = StubExplainer::per_finding("advice ");
+        for output in ["json", "sarif"] {
+            let flagged = ["scan", "--output", output, "--explain"];
+            let plain = ["scan", "--output", output];
+            assert_eq!(
+                run_explained(&flagged, &root, &stub).1,
+                run_scan(&plain, &root).1
+            );
+        }
+        let report = ["scan", "--output", "json", "--report", "r.json"];
+        let explained = run_explained(&report, &root, &stub);
+        let explained_bytes = std::fs::read(root.join("r.json")).unwrap();
+        let plain = run_scan(&report, &root);
+        assert_eq!(explained.0, plain.0);
+        assert_eq!(explained.1, plain.1);
+        assert_eq!(explained_bytes, std::fs::read(root.join("r.json")).unwrap());
     }
 
     #[test]

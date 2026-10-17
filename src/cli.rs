@@ -1,9 +1,10 @@
 //! Command-line surface: exactly one command, `sentinel scan`.
 //!
 //! clap owns parsing; every rejected invocation is a usage error (stderr
-//! diagnostics, empty stdout, exit 2). `--ci`, `--offline`, `--output`, and
-//! `--report` are the only supported options; anything else is rejected, so
-//! `--explain` and positional arguments cannot silently become no-ops.
+//! diagnostics, empty stdout, exit 2). `--ci`, `--offline`, `--output`,
+//! `--report`, and the advisory-only `--explain` are the only supported
+//! options; anything else is rejected, so positional arguments and unknown
+//! flags cannot silently become no-ops.
 
 use std::path::PathBuf;
 
@@ -35,6 +36,11 @@ pub enum Command {
         /// Disable network and cache writes; use any-age cache only.
         #[arg(long)]
         offline: bool,
+        /// Show one advisory line per finding on terminal output.
+        /// Advisory-only: never changes findings, severity, ordering, or the
+        /// exit code, and is forced off under `--ci` and `--offline`.
+        #[arg(long)]
+        explain: bool,
         /// Report format: terminal, json, or sarif (default terminal).
         #[arg(long, value_enum, default_value = "terminal")]
         output: OutputFormat,
@@ -115,14 +121,18 @@ mod tests {
     #[test]
     fn unsupported_arguments_are_usage_errors() {
         for tokens in [
-            &["scan", "--explain"][..],
-            &["scan", "some-file.txt"],
+            &["scan", "some-file.txt"][..],
             &["scan", "--help"],
             &["scan", "--version"],
         ] {
             let err = parse(&args(tokens)).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{tokens:?}");
         }
+    }
+    #[test]
+    fn explain_flag_is_accepted() {
+        let cli = parse(&args(&["scan", "--explain"])).unwrap();
+        assert!(matches!(cli.command, Command::Scan { explain: true, .. }));
     }
     #[test]
     fn missing_subcommand_is_a_usage_error() {
