@@ -3,6 +3,7 @@
 //! Only `RULE-weak-hash` is implemented in this unit; the remaining rules
 //! arrive as further entries in the rule table.
 
+pub mod javascript;
 pub mod lang;
 
 use std::sync::OnceLock;
@@ -37,7 +38,7 @@ pub(crate) struct RuleDef {
 }
 
 /// The production table; PR2/PR3 extend this list without other changes.
-const RULE_DEFS: &[RuleDef] = &[];
+const RULE_DEFS: &[RuleDef] = &[javascript::WEAK_HASH_DEF];
 
 /// The code-rules engine over a compiled rule table.
 pub struct RulesEngine {
