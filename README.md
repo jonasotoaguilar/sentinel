@@ -42,12 +42,25 @@ Download the archive for your platform from [the latest release](https://github.
 - `sentinel-<tag>-aarch64-apple-darwin.tar.gz` → `sentinel` (macOS Apple silicon)
 - `sentinel-<tag>-x86_64-pc-windows-msvc.zip` → `sentinel.exe` (Windows x86_64)
 - `sentinel-<tag>-checksums.txt` — sha256 checksums for the archives
+- `sentinel-<tag>-sbom.json` — a CycloneDX 1.3 SBOM of the build
 
-Verify a download before running it:
+Verify a download before running it. The checksums catch a corrupted transfer,
+and the attestation proves the file was built by this repository's release
+workflow rather than merely uploaded somewhere:
 
 ```bash
 sha256sum -c sentinel-<tag>-checksums.txt
+
+# needs GitHub CLI 2.49 or newer
+gh attestation verify sentinel-<tag>-x86_64-unknown-linux-gnu.tar.gz \
+  --repo jonasotoaguilar/sentinel
 ```
+
+The provenance is keyless: it is bound to the release workflow's own identity
+through OpenID Connect, so there is no signing key to distribute or trust
+separately, and nothing for this project to keep secret. The SBOM is generated
+at release time and describes the dependency view of the publishing runner,
+which is the trade a single SBOM per release makes.
 
 ### From crates.io (needs a Rust toolchain)
 
@@ -216,7 +229,7 @@ cargo audit         # advisory scan of Sentinel's own dependencies
 cargo deny          # license / dependency policy check
 ```
 
-Releases are planned to be signed, checksummed, and shipped with an SBOM.
+Releases are **not signed with a long-lived key**, deliberately: provenance comes from a keyless attestation bound to the release workflow's identity, which is verifiable with `gh attestation verify` (GitHub CLI 2.49+). Every release ships three platform archives, a checksums file, and a CycloneDX SBOM, and all five files carry the attestation.
 
 ## Stack
 

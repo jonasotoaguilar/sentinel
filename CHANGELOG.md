@@ -8,7 +8,46 @@ The versioning policy below is the project's single versioning policy: no other
 versioning or release policy exists in this repository (`.github/workflows/release.yml`
 documents release mechanics — archive layout and checksums — not versioning).
 
-## [Unreleased]
+## [0.2.0] - 2026-10-17
+
+Adoption controls and a release you can verify. Nothing about scanning changed
+in this release; what changed is what you can tell Sentinel to do and what you
+can prove about the binary you downloaded.
+
+### Added
+
+- **Configuration files.** `sentinel.toml` in the repository and a user config
+  under `$XDG_CONFIG_HOME/sentinel/config.toml`, resolved as
+  CLI > project > user > default. List keys union across levels; scalar keys
+  override. `$SENTINEL_CONFIG` names an explicit file.
+- **`--exclude <GLOB>` (repeatable) and `.sentinelignore`**, so files a project
+  does not consider its own can be left out of the scan.
+- **`--fail-under <critical|high|medium|low|none>`**, so a pipeline decides
+  which severities block it. The default, `low`, is the previous behaviour:
+  any finding exits 1.
+- **`scan [PATH]`**, so a scan can target another checkout without changing
+  directory, with that target's own config, ignore file and CI mode applied.
+- **`--baseline <PATH>` and `--update-baseline`.** Accepted findings are
+  recorded by content (engine, rule and digest), so acceptance survives a
+  rename, a move or a shifted line. They are still reported — marked
+  `[accepted]`, `"accepted": true` in JSON, and as SARIF suppressions — but they
+  no longer fail the build. The documented trade: the same value and rule is
+  accepted everywhere it appears.
+- **`cache path`, `cache clear`, `cache prune [--older-than <DAYS>]` and
+  `scan --no-cache`.** The only destructive command states its safety model:
+  the root is validated, every candidate is checked for containment, symlinks
+  are unlinked rather than followed, the cache root itself is never removed, and
+  the command refuses to run when the working directory is inside the cache.
+- **Verifiable releases.** Every release now carries a keyless build-provenance
+  attestation and a CycloneDX SBOM attestation, verifiable with
+  `gh attestation verify`. No signing key exists to rotate or leak.
+- **Repository hygiene:** Dependabot updates grouped by week, a code of conduct,
+  and a dependency policy in `SECURITY.md` that points at `deny.toml` as the
+  enforced source of truth.
+
+### Fixed
+
+- `SECURITY.md` no longer claims that no releases have been published.
 
 ## [0.1.0]
 
