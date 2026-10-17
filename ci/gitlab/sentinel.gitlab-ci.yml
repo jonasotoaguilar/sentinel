@@ -1,0 +1,67 @@
+# Sentinel for GitLab CI. Include it and the scan runs on every pipeline:
+#
+#   include:
+#     - remote: https://raw.githubusercontent.com/jonasotoaguilar/sentinel/main/ci/gitlab/sentinel.gitlab-ci.yml
+#       inputs:
+#         fail_under: high
+#
+# Requires GitLab 16.11 or newer for `include: ... inputs`, and 15.0 or newer
+# for the SARIF report below. The job downloads the release archive for the
+# runner's platform and checks it against the release's checksums before
+# running it, because a scanner that trusts an unverified binary is not a
+# scanner you should run on your repository.
+spec:
+  inputs:
+    stage:
+      default: test
+    path:
+      default: "."
+    fail_under:
+      default: "low"
+    version:
+      default: "latest"
+    job_name:
+      default: "sentinel"
+---
+"$[[ inputs.job_name ]]":
+  stage: $[[ inputs.stage ]]
+  image: debian:stable-slim
+  variables:
+    SENTINEL_VERSION: $[[ inputs.version ]]
+    SENTINEL_PATH: $[[ inputs.path ]]
+    SENTINEL_FAIL_UNDER: $[[ inputs.fail_under ]]
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq curl ca-certificates git >/dev/null
+  script:
+    - |
+      set -euo pipefail
+      case "$(uname -m)" in
+        x86_64) TARGET=x86_64-unknown-linux-gnu ;;
+        *) echo "sentinel: unsupported architecture $(uname -m)"; exit 2 ;;
+      esac
+      if [ "$SENTINEL_VERSION" = "latest" ]; then
+        SENTINEL_VERSION=$(curl -fsSL https://api.github.com/repos/jonasotoaguilar/sentinel/releases/latest \
+          | grep -m1 '"tag_name"' | cut -d'"' -f4)
+      fi
+      BASE="https://github.com/jonasotoaguilar/sentinel/releases/download/${SENTINEL_VERSION}"
+      ASSET="sentinel-${SENTINEL_VERSION}-${TARGET}.tar.gz"
+      # Downloaded under its published name, because `sha256sum -c` reads the
+      # file name out of the checksums file and would otherwise report the
+      # archive as unreadable instead of verifying it.
+      curl -fsSL -o "$ASSET" "${BASE}/${ASSET}"
+      curl -fsSL -o sentinel-checksums.txt "${BASE}/sentinel-${SENTINEL_VERSION}-checksums.txt"
+      # Only the line for this asset: the file covers every asset. `--strict`
+      # matters here - without it a listed file that cannot be read is a warning
+      # and the command still exits 0, which is a green light that verified
+      # nothing at all.
+      grep " ${ASSET}$" sentinel-checksums.txt | sha256sum -c --strict -
+      tar xzf "$ASSET"
+      install -m 0755 sentinel /usr/local/bin/sentinel
+      sentinel --version
+      sentinel scan "$SENTINEL_PATH" --ci --output sarif --fail-under "$SENTINEL_FAIL_UNDER" --report sentinel.sarif
+  artifacts:
+    when: always
+    paths:
+      - sentinel.sarif
+    reports:
+      sarif: sentinel.sarif
