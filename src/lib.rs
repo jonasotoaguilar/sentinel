@@ -19,6 +19,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
+use clap::CommandFactory;
 use rayon::prelude::*;
 
 use cli::{Command, OutputFormat};
@@ -27,10 +28,10 @@ use engine::secrets::SecretsEngine;
 use explain::{DisabledExplainer, ExplainError, Explainer};
 use finding::Diagnostic;
 
-/// Runs the scan pipeline and returns the process exit code. Usage errors and
-/// operational failures map to exit 2; a completed scan exits 1 with findings
-/// and 0 otherwise. The report is the only stdout content; diagnostics go to
-/// stderr.
+/// Runs the requested command and returns the process exit code. Usage errors
+/// and operational failures map to exit 2; a completed scan exits 1 with
+/// findings and 0 otherwise. The report (or the completion script) is the
+/// only stdout content; diagnostics go to stderr.
 pub fn run(
     args: &[String],
     cwd: &Path,
@@ -79,13 +80,25 @@ pub fn run_with_deps(
             return ExitCode::from(errors::EXIT_OPERATIONAL);
         }
     };
+    // `completions` is a pure side command: the script is generated from the
+    // live command definition and written to the injected stdout writer
+    // without entering the scan pipeline, so no discovery, cache, network,
+    // or repository access happens.
+    if let Command::Completions { shell } = &cli.command {
+        let mut cmd = cli::Cli::command();
+        clap_complete::generate(*shell, &mut cmd, "sentinel", stdout);
+        return ExitCode::SUCCESS;
+    }
     let Command::Scan {
         ci,
         offline,
         output,
         report,
         explain,
-    } = cli.command;
+    } = cli.command
+    else {
+        unreachable!("`Completions` returns above, so only `Scan` reaches here");
+    };
     let mode = if ci {
         discovery::Mode::Ci
     } else {

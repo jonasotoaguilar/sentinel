@@ -8,6 +8,7 @@ license = "MIT"
 anyhow = "1"
 blake3 = { version = "1", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 ignore = "0.4"
 directories = "6"
 percent-encoding = "2"
