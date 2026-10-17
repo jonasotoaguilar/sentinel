@@ -1,14 +1,13 @@
 //! Code-rules engine (PR1 skeleton plus the JavaScript/TypeScript rule set);
 //! Python rules arrive as further entries in the rule table.
 
-pub mod fallback;
 pub mod javascript;
 pub mod lang;
 pub mod python;
 
 use std::sync::OnceLock;
 
-use tree_sitter::{Language, Parser};
+use tree_sitter::{Language, Node, Parser};
 
 use crate::engine::secrets::{
     Candidate, REDACTION_PLACEHOLDER, SecretsEngine, digest_of, line_text, locate,
@@ -50,7 +49,6 @@ const RULE_DEFS: &[RuleDef] = &[
 /// The code-rules engine over a compiled rule table.
 pub struct RulesEngine {
     rules: Vec<RuleDef>,
-    fallback: Vec<fallback::CompiledFallback>,
     redactor: SecretsEngine,
     init_diagnostics: Vec<Diagnostic>,
 }
@@ -78,13 +76,8 @@ impl RulesEngine {
             }
             rules.push(*def);
         }
-        // Fallback entries compile with the same containment: one
-        // `rule-failed` diagnostic per bad pattern, the rest still run.
-        let (fallback, fallback_diagnostics) = fallback::compile_fallback(fallback::FALLBACK_DEFS);
-        init_diagnostics.extend(fallback_diagnostics);
         Self {
             rules,
-            fallback,
             redactor: SecretsEngine::new(),
             init_diagnostics,
         }
@@ -106,10 +99,12 @@ impl RulesEngine {
     }
 
     /// Scans one file with its diagnostics. A file the grammar cannot
-    /// parse — no tree, or a tree whose root reports an error — degrades
-    /// to the conservative fallback for that file only: no AST rule runs
-    /// on the untrustworthy tree, and exactly one `rule-fallback`
-    /// diagnostic names the path.
+    /// fully parse is scanned by the same rules and matchers a parseable
+    /// file uses, restricted to the regions the parser recovered: a match
+    /// that sits inside a region the parser reported as damaged is
+    /// discarded, and exactly one `rule-fallback` diagnostic discloses the
+    /// reduced coverage. A file with no usable tree produces the diagnostic
+    /// alone.
     pub fn scan_with_diagnostics(
         &self,
         path: &str,
@@ -132,50 +127,37 @@ impl RulesEngine {
             return (Vec::new(), Vec::new());
         }
         let Some(tree) = parser.parse(bytes, None) else {
-            return self.fallback_for(path, language, bytes);
+            return (
+                Vec::new(),
+                vec![Diagnostic::rule_fallback(
+                    path,
+                    "the file did not parse; no rule was applied",
+                )],
+            );
         };
-        if tree.root_node().has_error() {
-            return self.fallback_for(path, language, bytes);
-        }
         let root = tree.root_node();
+        let degraded = root.has_error();
         let mut candidates = Vec::new();
         for rule in &self.rules {
             if !rule.languages.contains(&language) {
                 continue;
             }
             for hit in (rule.matches)(bytes, root) {
+                if degraded && in_damaged_region(root, hit.start, hit.end) {
+                    continue;
+                }
                 candidates.push(self.candidate(rule.id, rule.severity, rule.message, bytes, hit));
             }
         }
-        (candidates, Vec::new())
-    }
-
-    /// Conservative regex coverage for one unparseable file, gated by the
-    /// file's language like the AST rules.
-    fn fallback_for(
-        &self,
-        path: &str,
-        language: lang::RulesLanguage,
-        bytes: &[u8],
-    ) -> (Vec<Candidate>, Vec<Diagnostic>) {
-        let diagnostic =
-            Diagnostic::rule_fallback(path, "parse failed; applied conservative fallback");
-        let mut candidates = Vec::new();
-        for rule in &self.fallback {
-            if !rule.rule.languages.contains(&language) {
-                continue;
-            }
-            for (start, end) in rule.find_ranges(bytes) {
-                candidates.push(self.candidate(
-                    rule.rule.id,
-                    rule.rule.severity,
-                    rule.rule.message,
-                    bytes,
-                    Hit { start, end },
-                ));
-            }
-        }
-        (candidates, vec![diagnostic])
+        let diagnostics = if degraded {
+            vec![Diagnostic::rule_fallback(
+                path,
+                "the file did not fully parse; only recovered regions were scanned",
+            )]
+        } else {
+            Vec::new()
+        };
+        (candidates, diagnostics)
     }
 
     /// Builds one candidate through the shared boundary: the matched
@@ -201,6 +183,28 @@ impl RulesEngine {
             digest: digest_of(&bytes[hit.start..hit.end]),
         }
     }
+}
+
+/// True when a matched range sits in a region the parser reported as damaged.
+/// The root of a degraded file always reports an error, so an ancestor's
+/// blanket `has_error` can never be consulted here: only the matched node's own
+/// subtree and its ancestors' error and missing markers are inspected.
+fn in_damaged_region(root: Node<'_>, start: usize, end: usize) -> bool {
+    let Some(node) = root.descendant_for_byte_range(start, end) else {
+        // A range the tree cannot locate is not evidence, so it is discarded.
+        return true;
+    };
+    if node.has_error() {
+        return true;
+    }
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.is_error() || parent.is_missing() {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
 }
 
 /// Lazily compiled grammar holders (design D2): converted once per
@@ -276,6 +280,113 @@ mod tests {
         let found = engine.scan("a.js", b"const h = 1;");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].rule_id, "RULE-synthetic");
+    }
+
+    #[test]
+    fn degraded_files_never_report_what_the_parseable_twin_would_not() {
+        let engine = RulesEngine::new();
+        let cases = [
+            ("a.js", "other.createHash('md5');\nfunction broken( {\n"),
+            ("a.js", "crypto.CREATEHASH('md5');\nfunction broken( {\n"),
+            ("a.js", "// crypto.createHash('md5');\nfunction broken( {\n"),
+            (
+                "a.js",
+                "const s = \"crypto.createHash('md5')\";\nfunction broken( {\n",
+            ),
+            ("a.js", "obj.eval(userInput);\nfunction broken( {\n"),
+            (
+                "a.js",
+                "child_process.exec(cmd, {x: a + b});\nfunction broken( {\n",
+            ),
+            (
+                "a.js",
+                "child_process.exec(cmd /* + x */);\nfunction broken( {\n",
+            ),
+            (
+                "a.js",
+                "eval(\"print(1)\");\ncrypto.createHash(\"sha256\");\nfunction broken( {\n",
+            ),
+            ("a.py", "foo.hashlib.md5(data)\ndef broken( :\n"),
+            (
+                "a.py",
+                "subprocess.run(cmd, shell=Trueish)\ndef broken( :\n",
+            ),
+            (
+                "a.py",
+                "x = \"subprocess.run(cmd, shell=True)\"\ndef broken( :\n",
+            ),
+            (
+                "a.py",
+                "yaml.load(\n    data,\n    Loader=yaml.SafeLoader)\ndef broken( :\n",
+            ),
+        ];
+        let mut invented = Vec::new();
+        for (path, source) in cases {
+            let (found, diagnostics) = engine.scan_with_diagnostics(path, source.as_bytes());
+            if !found.is_empty() {
+                invented.push((path, source, found));
+            }
+            assert_eq!(
+                diagnostics.len(),
+                1,
+                "path {path} source {source:?}: expected exactly one diagnostic"
+            );
+            assert_eq!(diagnostics[0].code, "rule-fallback");
+        }
+        assert!(
+            invented.is_empty(),
+            "degraded scan invented findings: {invented:?}"
+        );
+    }
+
+    #[test]
+    fn degraded_javascript_still_reports_recovered_regions_and_warns_once() {
+        let (found, diagnostics) = RulesEngine::new().scan_with_diagnostics(
+            "broken.js",
+            b"const h = crypto.createHash('md5');\nfunction broken( {\n",
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].rule_id, "RULE-weak-hash");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "rule-fallback");
+        assert_eq!(diagnostics[0].path, "broken.js");
+    }
+
+    #[test]
+    fn parseable_files_emit_no_fallback_diagnostic() {
+        let (found, diagnostics) = RulesEngine::new()
+            .scan_with_diagnostics("a.js", b"const h = crypto.createHash('md5');\n");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].rule_id, "RULE-weak-hash");
+        assert!(diagnostics.is_empty(), "got {diagnostics:?}");
+    }
+
+    #[test]
+    fn degraded_file_without_a_match_warns_once_and_reports_nothing() {
+        let (found, diagnostics) =
+            RulesEngine::new().scan_with_diagnostics("a.js", b"const h = 1;\nfunction broken( {\n");
+        assert!(found.is_empty(), "got {found:?}");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "rule-fallback");
+    }
+
+    #[test]
+    fn degraded_and_parseable_scans_agree_on_location_and_digest() {
+        let engine = RulesEngine::new();
+        let (clean_found, clean_diagnostics) =
+            engine.scan_with_diagnostics("a.js", b"crypto.createHash('md5');\n");
+        let (recovered_found, recovered_diagnostics) = engine
+            .scan_with_diagnostics("a.js", b"crypto.createHash('md5');\nfunction broken( {\n");
+        assert_eq!(clean_found.len(), 1);
+        assert_eq!(recovered_found.len(), 1);
+        assert_eq!(
+            (recovered_found[0].line, recovered_found[0].column),
+            (clean_found[0].line, clean_found[0].column),
+        );
+        assert_eq!(recovered_found[0].digest, clean_found[0].digest);
+        assert!(clean_diagnostics.is_empty(), "got {clean_diagnostics:?}");
+        assert_eq!(recovered_diagnostics.len(), 1);
+        assert_eq!(recovered_diagnostics[0].code, "rule-fallback");
     }
 
     #[test]

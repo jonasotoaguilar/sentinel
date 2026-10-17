@@ -97,8 +97,8 @@ impl Diagnostic {
         }
     }
 
-    /// A file could not be parsed, so the conservative regex fallback
-    /// covered it instead of the AST rules; the scan continues.
+    /// A file could not be fully parsed, so only the regions the parser
+    /// recovered were scanned; the scan continues with reduced coverage.
     pub fn rule_fallback(path: &str, message: &str) -> Self {
         Self {
             code: "rule-fallback",
