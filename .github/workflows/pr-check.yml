@@ -158,6 +158,27 @@ jobs:
               core.setFailed(failures.join('\n\n'));
             }
 
+  docker-build:
+    name: Docker Image Builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Build the image
+        # The release workflow tolerates a failed image push, because a
+        # registry outage must not retroactively fail a Release that is
+        # already published. That makes this job the only thing that
+        # actually fails on a broken Dockerfile, which is why it exists.
+        run: docker build --tag sentinel:ci .
+      - name: The image runs, and not as root
+        run: |
+          set -euo pipefail
+          docker run --rm sentinel:ci --version
+          uid=$(docker run --rm --entrypoint=id sentinel:ci -u)
+          [ "$uid" != "0" ] || { echo "::error::the image runs as root"; exit 1; }
+          echo "runs as uid $uid"
+
   check-type-label:
     # Dependabot opens its pull requests without an issue and without a
     # type:* label, neither of which it can create. The exemption is

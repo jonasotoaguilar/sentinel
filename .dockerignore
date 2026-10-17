@@ -1,0 +1,28 @@
+# Build context for the release image. The build stage runs
+# `cargo build --release --locked`, which reads only the manifest, the
+# pinned lockfile, and the source tree — everything else is excluded so
+# pushed context stays small. In particular `.git/` is excluded on purpose:
+# the crate version comes from Cargo.toml (CARGO_PKG_VERSION) and no build
+# script reads git metadata, so leaving the history out cannot change the
+# binary. Nothing listed here is read by the build; Cargo.toml, Cargo.lock,
+# and src/ stay included.
+target/
+.git/
+.github/
+docs/
+examples/
+man/
+ci/
+tests/
+odd/
+.agents/
+.codegraph/
+.ui/
+.vscode/
+.idea/
+.githooks/
+*.log
+lcov.info
+clippy.sarif
+Dockerfile
+.dockerignore
