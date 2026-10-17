@@ -236,6 +236,25 @@ mod tests {
     }
 
     #[test]
+    fn rules_engine_findings_flow_through_scan() {
+        let (_dir, root) = temp_repo();
+        write_tracked(
+            &root,
+            OsStr::new("app.js"),
+            b"const h = crypto.createHash('md5');\n",
+        );
+        let (code, out, err) = run_scan(&["scan"], &root);
+        assert_eq!(code, ExitCode::from(1));
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(out_text.contains("RULE-weak-hash"), "stdout: {out_text}");
+        assert!(out_text.contains("app.js:1:"), "stdout: {out_text}");
+        assert!(
+            String::from_utf8(err).unwrap().is_empty(),
+            "rules findings warn nothing on stderr"
+        );
+    }
+
+    #[test]
     fn failing_rule_diagnostic_stays_on_stderr_and_out_of_the_report_file() {
         let (_dir, root) = secret_repo();
         let report = root.join("out.json");
