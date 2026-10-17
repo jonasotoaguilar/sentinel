@@ -131,7 +131,12 @@ pub fn run_with_deps(
     let scans = files
         .par_iter()
         .map(|path| {
-            let path_text = path.to_string_lossy().replace('\\', "/");
+            // Paths travel into finding ids, snippets of payloads, and
+            // terminal output, so a secret in a file or directory name is
+            // redacted with the production table while the path stays
+            // readable; the finding digest never covers the path.
+            let path_text =
+                SecretsEngine::redact_production(&path.to_string_lossy().replace('\\', "/"));
             let bytes = std::fs::read(root.join(path))
                 .map_err(|error| Diagnostic::read_failed(&path_text, &error))?;
             let (rule_candidates, rule_diagnostics) =
