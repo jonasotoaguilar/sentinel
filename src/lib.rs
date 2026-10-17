@@ -130,9 +130,49 @@ pub(crate) fn apply_findings_budget(
 /// The pipeline over an explicit engine and explainer (tests inject the stub,
 /// so no test touches the network). The explainer runs at most once per scan:
 /// only when `--explain` was requested, allowed, and configured.
+/// Whether these args request an offline scan. Lets [`run_with_deps`] skip
+/// building the OSV client entirely on the offline path; pure arg peek, so
+/// the pipeline below keeps the single parse that owns error reporting.
+fn is_offline_scan(args: &[String]) -> bool {
+    matches!(
+        cli::parse(args),
+        Ok(cli) if matches!(cli.command, Command::Scan { offline: true, .. })
+    )
+}
+
+/// The production entry over an explicit engine and explainer (tests inject
+/// both): builds exactly the dependency client an online scan uses — and no
+/// client at all for `--offline` — then delegates to [`run_with_dep_client`],
+/// so policy and exit codes cannot drift between the two paths.
 pub fn run_with_deps(
     engine: &SecretsEngine,
     explainer: &dyn Explainer,
+    args: &[String],
+    cwd: &Path,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ExitCode {
+    // `None` means offline: the offline branch constructs zero OSV clients,
+    // and the online path receives exactly the client built today.
+    let osv: Option<Box<dyn crate::osv::client::OsvApi>> = if is_offline_scan(args) {
+        None
+    } else {
+        Some(match crate::osv::client::UreqOsvClient::maybe_new(false) {
+            Some(client) => Box::new(client),
+            None => Box::new(crate::osv::client::StubOsv::new(vec![])),
+        })
+    };
+    run_with_dep_client(engine, explainer, osv, args, cwd, stdout, stderr)
+}
+
+/// The dependency-client seam: the online path's OSV client injected by the
+/// caller (`None` means offline), so the unreachable-endpoint contract is
+/// testable without a network dial. [`run_with_deps`] is the single caller;
+/// production behaviour is unchanged — same client, same policy, same exit codes.
+pub(crate) fn run_with_dep_client(
+    engine: &SecretsEngine,
+    explainer: &dyn Explainer,
+    osv: Option<Box<dyn crate::osv::client::OsvApi>>,
     args: &[String],
     cwd: &Path,
     stdout: &mut dyn Write,
@@ -303,12 +343,13 @@ pub fn run_with_deps(
     let dep_engine = if offline {
         crate::engine::dependency::DependencyEngine::offline(dep_cache)
     } else {
-        let osv: Box<dyn crate::osv::client::OsvApi> =
-            match crate::osv::client::UreqOsvClient::maybe_new(false) {
-                Some(c) => Box::new(c),
-                None => Box::new(crate::osv::client::StubOsv::new(vec![])),
-            };
-        crate::engine::dependency::DependencyEngine::online(dep_cache, osv)
+        match osv {
+            Some(client) => crate::engine::dependency::DependencyEngine::online(dep_cache, client),
+            // Unreachable through the single caller, which always provides
+            // the client for online scans; degrade offline rather than
+            // invent network I/O.
+            None => crate::engine::dependency::DependencyEngine::offline(dep_cache),
+        }
     };
     // The review reads through the original file list, so what is read,
     // cached, and looked up stays byte-identical; only the finding's display
@@ -758,6 +799,131 @@ mod tests {
             String::from_utf8(o)
                 .unwrap()
                 .contains("SECRET-synthetic-token")
+        );
+    }
+
+    /// Runs inside the re-execed child (see below): the same test binary, but
+    /// the child owns a private `XDG_CACHE_HOME`, so the cold cache is
+    /// hermetic without racing parallel tests over process environment. Also
+    /// proves the offline path constructs zero OSV clients.
+    fn cold_cache_child_main() {
+        use crate::explain::DisabledExplainer;
+        use crate::osv::client::{OsvApi, Query, constructions};
+        // Why: the contract "network or cache degradation never exits 2" had
+        // no test for online plus a cold cache with OSV unreachable, and the
+        // endpoint is a constant, so only the injected-client seam can stage it.
+        struct FailOsv;
+        impl OsvApi for FailOsv {
+            fn query_all(
+                &self,
+                _qs: &[Query],
+            ) -> Result<
+                (
+                    Vec<Vec<crate::osv::validate::Advisory>>,
+                    Vec<crate::finding::Diagnostic>,
+                ),
+                String,
+            > {
+                Err("synthetic network failure".into())
+            }
+            fn vuln(&self, _id: &str) -> Result<crate::osv::validate::Advisory, String> {
+                Err("synthetic network failure".into())
+            }
+        }
+        let before = constructions();
+        // Offline first: this path must build no OSV client at all.
+        let (_dir, offline_root) = temp_repo();
+        write_tracked(
+            &offline_root,
+            OsStr::new("requirements.txt"),
+            b"sentinel-synthetic-miss==9.9.9\n",
+        );
+        let offline_args = vec!["scan".to_string(), "--offline".to_string()];
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = super::run_with_deps(
+            &SecretsEngine::new(),
+            &DisabledExplainer,
+            &offline_args,
+            &offline_root,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "an offline miss degrades, never exits 2"
+        );
+        assert_eq!(
+            constructions(),
+            before,
+            "an --offline scan constructs zero OSV clients"
+        );
+        // Then online with a cold cache and an unreachable OSV: exit 1,
+        // findings intact, and the reason on stderr.
+        let (_dir, root) = temp_repo();
+        write_tracked(
+            &root,
+            OsStr::new("requirements.txt"),
+            b"sentinel-synthetic-miss==9.9.9\n",
+        );
+        write_tracked(
+            &root,
+            OsStr::new("env.example"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        let args = vec!["scan".to_string()];
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = super::run_with_dep_client(
+            &SecretsEngine::new(),
+            &DisabledExplainer,
+            Some(Box::new(FailOsv)),
+            &args,
+            &root,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, ExitCode::from(1), "a degraded scan exits 1, never 2");
+        let stdout = String::from_utf8(out).unwrap();
+        assert!(
+            stdout.contains("SECRET-synthetic-token"),
+            "findings survive degradation: {stdout}"
+        );
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(
+            stderr.contains("osv-unavailable"),
+            "the scan says why: {stderr}"
+        );
+    }
+
+    #[test]
+    fn online_cold_cache_failure_degrades_without_exit_two() {
+        // Mutating process environment from a parallel test is a race, so the
+        // child process below owns its environment instead (the proxy
+        // isolation in tests/dependency.rs): a fresh `XDG_CACHE_HOME` makes
+        // the cold cache hermetic, and the parent asserts the child ran.
+        if std::env::var("SENTINEL_COLD_CACHE_CHILD").is_ok() {
+            cold_cache_child_main();
+            return;
+        }
+        let xdg = TempDir::new().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("tests::online_cold_cache_failure_degrades_without_exit_two")
+            .env("SENTINEL_COLD_CACHE_CHILD", "1")
+            .env("XDG_CACHE_HOME", xdg.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child must complete its scans: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child ran its scan assertions: {}",
+            String::from_utf8_lossy(&output.stdout)
         );
     }
 

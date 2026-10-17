@@ -15,7 +15,6 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::{Duration, Instant};
 
 use assert_cmd::Command as AssertCommand;
 use tempfile::TempDir;
@@ -36,8 +35,6 @@ enum Respond {
     Echo,
     /// A fixed status code and body.
     Fixed(u16, &'static str),
-    /// Accept the request, then stall past the client timeout.
-    Stall,
 }
 
 /// Spawns a loopback stub endpoint. Returns its URL plus the recorded request
@@ -64,14 +61,9 @@ fn stub_server(mode: Respond) -> Recorded {
             // legitimate request is already counted: no sleep needed.
             kept_count.fetch_add(1, Ordering::SeqCst);
             kept_bodies.lock().unwrap().push(body.clone());
-            if matches!(mode, Respond::Stall) {
-                std::thread::sleep(Duration::from_secs(30));
-                continue;
-            }
             let (status, text) = match &mode {
                 Respond::Echo => (200, echo_advisories(&body)),
                 Respond::Fixed(status, text) => (*status, (*text).to_string()),
-                Respond::Stall => unreachable!("handled above"),
             };
             let reason = if status == 200 { "OK" } else { "Error" };
             let reply = format!(
@@ -331,43 +323,6 @@ fn malformed_body_degrades_to_explain_invalid() {
         stderr.matches("explain-invalid").count(),
         1,
         "stderr: {stderr}"
-    );
-}
-
-#[test]
-fn stalled_endpoint_is_bounded_by_the_ten_second_timeout() {
-    let (_dir, root) = secret_repo();
-    let (url, _bodies, count) = stub_server(Respond::Stall);
-    let started = Instant::now();
-    let output = scan_explained(&root, &url, &["--explain"]);
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed >= Duration::from_secs(10),
-        "the full timeout runs: {elapsed:?}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(30),
-        // The stub itself gives up at 30 s, so returning before then proves
-        // the client enforced its own 10 s timeout; the headroom absorbs a
-        // loaded runner without going tight against the timeout.
-        "the stall is bounded: {elapsed:?}"
-    );
-    assert_eq!(output.status.code(), Some(1), "exit code is untouched");
-    assert_eq!(
-        output.stdout,
-        scan(&root, &[]).stdout,
-        "findings are untouched"
-    );
-    let stderr = text_of(&output.stderr);
-    assert_eq!(
-        stderr.matches("explain-failed").count(),
-        1,
-        "stderr: {stderr}"
-    );
-    assert_eq!(
-        count.load(Ordering::SeqCst),
-        1,
-        "timeouts are never retried"
     );
 }
 

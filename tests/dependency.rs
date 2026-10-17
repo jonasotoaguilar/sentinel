@@ -259,6 +259,49 @@ fn unpinned_lines_skip_with_path_and_line_and_never_exit_two() {
 }
 
 #[test]
+fn unreadable_manifest_emits_exactly_one_read_failed() {
+    // Why: the scan shares what it reads with the dependency review, so one
+    // unreadable manifest warns once; the old second disk read warned twice.
+    let (_dir, root) = temp_repo();
+    track_fixture(&root, "dependency/requirements.txt", "requirements.txt");
+    let manifest = root.join("requirements.txt");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&manifest).is_ok() {
+            eprintln!(
+                "SKIP unreadable-manifest: file still readable despite mode 000 (running as root?)"
+            );
+            return;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        eprintln!("SKIP unreadable-manifest: mode-000 unreadability is Unix-only");
+        return;
+    }
+    let xdg = TempDir::new().unwrap();
+    let output = scan_with(xdg.path(), &root, &["--offline"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a read failure degrades, never exits 2"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "nothing is found through an unreadable manifest"
+    );
+    let stderr = text_of(&output.stderr);
+    assert_eq!(
+        stderr.matches("read-failed").count(),
+        1,
+        "exactly one read-failed per unreadable manifest: {stderr}"
+    );
+    assert!(stderr.contains("requirements.txt"), "stderr: {stderr}");
+}
+
+#[test]
 fn fresh_cache_serves_online_without_fetching_live_advisories() {
     let (_dir, root, xdg) = seeded_lock_repo();
     let before = snapshot_tree(&root);
@@ -469,14 +512,69 @@ enum OsvRespond {
     ProxyTrap,
 }
 
-/// The batch envelope every double answers success with: one severe
-/// synthetic advisory, so the query succeeds with no detail fetch.
+/// The batch envelope a success answers with when the request body carries
+/// no parsable queries: one severe synthetic advisory, so the query
+/// succeeds with no detail fetch.
 const BATCH_OK_BODY: &str = r#"{"results":[{"vulns":[{"id":"GHSA-TEST-0001","summary":"synthetic","severity":[{"type":"CVSS_V3","score":"9.8"}]}]}]}"#;
 
 fn batch_ok_reply() -> String {
     format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BATCH_OK_BODY}",
         BATCH_OK_BODY.len()
+    )
+}
+
+/// Derives one advisory id per queried package from the trailing digits of
+/// the package name, so result *i* names query *i* across chunk boundaries.
+/// Names without trailing digits fall back to the static synthetic id, so
+/// single-query doubles keep their existing assertions.
+fn advisory_id_for(package: &str) -> String {
+    let digits: String = package
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if digits.is_empty() {
+        "GHSA-TEST-0001".to_string()
+    } else {
+        format!("GHSA-{digits:0>4}")
+    }
+}
+
+/// Answers one batch request with one severe synthetic advisory per queried
+/// package, in request order, so concatenated per-chunk results stay
+/// index-aligned with the input queries. Each advisory carries a severity,
+/// so no detail fetch follows.
+fn batch_reply_for(body: &[u8]) -> String {
+    let mut ids = Vec::new();
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body)
+        && let Some(queries) = value.get("queries").and_then(|q| q.as_array())
+    {
+        for query in queries {
+            let name = query
+                .get("package")
+                .and_then(|package| package.get("name"))
+                .and_then(|name| name.as_str())
+                .unwrap_or("");
+            ids.push(advisory_id_for(name));
+        }
+    }
+    if ids.is_empty() {
+        return batch_ok_reply();
+    }
+    let results: Vec<serde_json::Value> = ids
+        .iter()
+        .map(|id| {
+            serde_json::json!({"vulns": [{"id": id, "summary": "synthetic", "severity": [{"type": "CVSS_V3", "score": "9.8"}]}]})
+        })
+        .collect();
+    let body = serde_json::json!({"results": results}).to_string();
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
     )
 }
 
@@ -529,7 +627,7 @@ fn osv_stub(respond: OsvRespond) -> (String, String, Arc<AtomicUsize>) {
                 proxy_trap(&mut stream, &kept);
                 continue;
             }
-            let (_, path, _) = osv_read_request(&mut stream);
+            let (_, path, body) = osv_read_request(&mut stream);
             if !path.contains("/querybatch") {
                 let _ = stream.write_all(
                     b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -538,7 +636,7 @@ fn osv_stub(respond: OsvRespond) -> (String, String, Arc<AtomicUsize>) {
             }
             kept.fetch_add(1, Ordering::SeqCst);
             let reply = match &respond {
-                OsvRespond::BatchOk => batch_ok_reply(),
+                OsvRespond::BatchOk => batch_reply_for(&body),
                 OsvRespond::Redirect(target) => format!(
                     "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 ),
@@ -733,4 +831,12 @@ fn osv_batch_chunks_at_a_thousand_queries() {
         "1 001 queries is two requests"
     );
     assert_eq!(results.len(), 1_001, "shape stays index-aligned");
+    for (i, advisories) in results.iter().enumerate() {
+        assert_eq!(advisories.len(), 1, "one advisory per query at index {i}");
+        assert_eq!(
+            advisories[0].id,
+            format!("GHSA-{i:04}"),
+            "result {i} belongs to query {i}"
+        );
+    }
 }

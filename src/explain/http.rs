@@ -360,4 +360,57 @@ mod tests {
         let result = explainer.explain(&[finding("id-0", "[REDACTED]")]);
         assert!(matches!(result, Err(ExplainError::Failed(_))));
     }
+
+    #[test]
+    fn stalled_endpoint_fails_fast_with_injected_timeout() {
+        use std::io::{Read, Write};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Instant;
+        // Why: `with_timeout` is the evidence hook for the 10-second bound;
+        // a stalling loopback proves the timeout fires on the same code path
+        // without spending ten seconds per suite run.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/explain");
+        let count = Arc::new(AtomicUsize::new(0));
+        let kept = Arc::clone(&count);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+                    let Ok(1) = stream.read(&mut byte) else { break };
+                    head.push(byte[0]);
+                }
+                kept.fetch_add(1, Ordering::SeqCst);
+                // Stall past the injected timeout without replying.
+                std::thread::sleep(Duration::from_secs(5));
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                );
+            }
+        });
+        let explainer = HttpExplainer::with_timeout(&url, "k", Duration::from_millis(100)).unwrap();
+        assert_eq!(explainer.timeout(), Duration::from_millis(100));
+        let started = Instant::now();
+        let result = explainer.explain(&[finding("id-0", "[REDACTED]")]);
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(result, Err(ExplainError::Failed(_))),
+            "a stall maps to explain-failed: {result:?}"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "timeouts are never retried"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the injected timeout fires fast: {elapsed:?}"
+        );
+    }
 }
