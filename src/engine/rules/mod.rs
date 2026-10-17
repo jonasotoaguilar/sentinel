@@ -7,7 +7,7 @@ pub mod python;
 
 use std::sync::OnceLock;
 
-use tree_sitter::{Language, Node, Parser};
+use tree_sitter::{Language, Parser};
 
 use crate::engine::secrets::{
     Candidate, REDACTION_PLACEHOLDER, SecretsEngine, digest_of, line_text, locate,
@@ -99,12 +99,11 @@ impl RulesEngine {
     }
 
     /// Scans one file with its diagnostics. A file the grammar cannot
-    /// fully parse is scanned by the same rules and matchers a parseable
-    /// file uses, restricted to the regions the parser recovered: a match
-    /// that sits inside a region the parser reported as damaged is
-    /// discarded, and exactly one `rule-fallback` diagnostic discloses the
-    /// reduced coverage. A file with no usable tree produces the diagnostic
-    /// alone.
+    /// fully parse is skipped and said so: no finding is reported for it
+    /// and exactly one `rule-fallback` diagnostic names the path. The
+    /// engine declines to guess what the text was meant to be, because
+    /// every recovery from a parse failure is a guess about intent and
+    /// two such guesses have been shown to invent findings.
     pub fn scan_with_diagnostics(
         &self,
         path: &str,
@@ -131,33 +130,30 @@ impl RulesEngine {
                 Vec::new(),
                 vec![Diagnostic::rule_fallback(
                     path,
-                    "the file did not parse; no rule was applied",
+                    "the file did not fully parse; no rule was applied to it",
                 )],
             );
         };
         let root = tree.root_node();
-        let degraded = root.has_error();
+        if root.has_error() {
+            return (
+                Vec::new(),
+                vec![Diagnostic::rule_fallback(
+                    path,
+                    "the file did not fully parse; no rule was applied to it",
+                )],
+            );
+        }
         let mut candidates = Vec::new();
         for rule in &self.rules {
             if !rule.languages.contains(&language) {
                 continue;
             }
             for hit in (rule.matches)(bytes, root) {
-                if degraded && in_damaged_region(root, hit.start, hit.end) {
-                    continue;
-                }
                 candidates.push(self.candidate(rule.id, rule.severity, rule.message, bytes, hit));
             }
         }
-        let diagnostics = if degraded {
-            vec![Diagnostic::rule_fallback(
-                path,
-                "the file did not fully parse; only recovered regions were scanned",
-            )]
-        } else {
-            Vec::new()
-        };
-        (candidates, diagnostics)
+        (candidates, Vec::new())
     }
 
     /// Builds one candidate through the shared boundary: the matched
@@ -183,28 +179,6 @@ impl RulesEngine {
             digest: digest_of(&bytes[hit.start..hit.end]),
         }
     }
-}
-
-/// True when a matched range sits in a region the parser reported as damaged.
-/// The root of a degraded file always reports an error, so an ancestor's
-/// blanket `has_error` can never be consulted here: only the matched node's own
-/// subtree and its ancestors' error and missing markers are inspected.
-fn in_damaged_region(root: Node<'_>, start: usize, end: usize) -> bool {
-    let Some(node) = root.descendant_for_byte_range(start, end) else {
-        // A range the tree cannot locate is not evidence, so it is discarded.
-        return true;
-    };
-    if node.has_error() {
-        return true;
-    }
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.is_error() || parent.is_missing() {
-            return true;
-        }
-        current = parent.parent();
-    }
-    false
 }
 
 /// Lazily compiled grammar holders (design D2): converted once per
@@ -283,6 +257,69 @@ mod tests {
     }
 
     #[test]
+    fn degraded_recovery_does_not_promote_the_next_line_of_a_broken_delimiter() {
+        let engine = RulesEngine::new();
+        let cases = [
+            (
+                "a.py",
+                "s = \"subprocess.run(cmd, shell=True)\n",
+                "s = \"subprocess.run(cmd, shell=True)\"\n",
+            ),
+            (
+                "a.py",
+                "s = \"hashlib.md5(data)\n",
+                "s = \"hashlib.md5(data)\"\n",
+            ),
+            (
+                "a.py",
+                "s = \"pickle.loads(payload)\n",
+                "s = \"pickle.loads(payload)\"\n",
+            ),
+            (
+                "a.py",
+                "s = \"yaml.load(data)\n",
+                "s = \"yaml.load(data)\"\n",
+            ),
+            (
+                "a.js",
+                "const s = \"hello\ncrypto.createHash('md5');\n",
+                "const s = \"hello crypto.createHash('md5');\";\n",
+            ),
+            (
+                "a.ts",
+                "const s = \"\neval(userInput);\n",
+                "const s = \"eval(userInput);\";\n",
+            ),
+            (
+                "a.tsx",
+                "const s = \"\nchild_process.exec(`ls ${dir}`);\n",
+                "const s = \"child_process.exec(`ls ${dir}`);\";\n",
+            ),
+            (
+                "a.js",
+                "/* hello\ncrypto.createHash('md5');\n",
+                "/* hello\ncrypto.createHash('md5');\n*/\n",
+            ),
+        ];
+        for (path, degraded, twin) in cases {
+            let (found, diagnostics) = engine.scan_with_diagnostics(path, degraded.as_bytes());
+            let (twin_found, twin_diagnostics) =
+                engine.scan_with_diagnostics(path, twin.as_bytes());
+            assert!(
+                twin_diagnostics.is_empty() && twin_found.is_empty(),
+                "{path} {twin:?}"
+            );
+            assert!(
+                found.is_empty(),
+                "{path} invented {found:?} from {degraded:?}"
+            );
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, "rule-fallback");
+            assert_eq!(diagnostics[0].path, path);
+        }
+    }
+
+    #[test]
     fn degraded_files_never_report_what_the_parseable_twin_would_not() {
         let engine = RulesEngine::new();
         let cases = [
@@ -340,19 +377,6 @@ mod tests {
     }
 
     #[test]
-    fn degraded_javascript_still_reports_recovered_regions_and_warns_once() {
-        let (found, diagnostics) = RulesEngine::new().scan_with_diagnostics(
-            "broken.js",
-            b"const h = crypto.createHash('md5');\nfunction broken( {\n",
-        );
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].rule_id, "RULE-weak-hash");
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code, "rule-fallback");
-        assert_eq!(diagnostics[0].path, "broken.js");
-    }
-
-    #[test]
     fn parseable_files_emit_no_fallback_diagnostic() {
         let (found, diagnostics) = RulesEngine::new()
             .scan_with_diagnostics("a.js", b"const h = crypto.createHash('md5');\n");
@@ -368,25 +392,6 @@ mod tests {
         assert!(found.is_empty(), "got {found:?}");
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code, "rule-fallback");
-    }
-
-    #[test]
-    fn degraded_and_parseable_scans_agree_on_location_and_digest() {
-        let engine = RulesEngine::new();
-        let (clean_found, clean_diagnostics) =
-            engine.scan_with_diagnostics("a.js", b"crypto.createHash('md5');\n");
-        let (recovered_found, recovered_diagnostics) = engine
-            .scan_with_diagnostics("a.js", b"crypto.createHash('md5');\nfunction broken( {\n");
-        assert_eq!(clean_found.len(), 1);
-        assert_eq!(recovered_found.len(), 1);
-        assert_eq!(
-            (recovered_found[0].line, recovered_found[0].column),
-            (clean_found[0].line, clean_found[0].column),
-        );
-        assert_eq!(recovered_found[0].digest, clean_found[0].digest);
-        assert!(clean_diagnostics.is_empty(), "got {clean_diagnostics:?}");
-        assert_eq!(recovered_diagnostics.len(), 1);
-        assert_eq!(recovered_diagnostics[0].code, "rule-fallback");
     }
 
     #[test]
