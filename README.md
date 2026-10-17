@@ -1,8 +1,8 @@
 # Sentinel
 
-Sentinel is a planned cross-platform Rust CLI that scans Git repositories for secrets and vulnerable dependencies before commit or in CI.
+Sentinel is a cross-platform Rust CLI that scans Git repositories for secrets and vulnerable dependencies before commit or in CI.
 
-> **Status: bootstrap / planned.** This repository currently contains no implementation. Sentinel is an MVP specification; every command and behavior below is the **intended interface**, not shipped functionality. Nothing is installable yet.
+> **Status: MVP implemented.** Sentinel scans Git repositories for secrets, vulnerable dependencies, and code-rule violations. The commands below are shipped functionality; the roadmap (rules engine, explain adapter, shell completions) is delivered and archived under `openspec/changes/archive/`.
 
 ## What Is This?
 
@@ -30,9 +30,9 @@ Sentinel runs a scan over a Git repository and reports findings in a reviewable 
 - Languages beyond the initial JavaScript/TypeScript and Python rule sets.
 - Any network service, server, or hosted backend.
 
-## Quick Start (placeholder)
+## Quick Start
 
-Sentinel is **not yet installable** — there is no published crate and no `Cargo.toml` in this repository. Installation instructions will live here once the binary crate exists. The intended usage looks like this:
+Build and run from this repository (`cargo run -- <args>`); the usage below is shipped:
 
 ```bash
 # Scan the current repository (git-aware discovery: tracked + untracked files, ignore-aware)
@@ -57,8 +57,6 @@ sentinel scan --offline
 eval "$(sentinel completions bash)"
 ```
 
-These examples describe the planned interface only. They will not run until the MVP is built.
-
 ## Security & Privacy Guarantees
 
 - `--explain` output is **advisory only**: it never sets severity or blocking decisions.
@@ -68,9 +66,7 @@ These examples describe the planned interface only. They will not run until the 
 - External data (OSV advisories, LLM responses) is treated as **untrusted** and sanitized before it reaches output or analysis.
 - Offline mode serves from cache and warns/skips gracefully when data is unavailable.
 
-## Planned Developer Commands
-
-Once the crate exists:
+## Developer Commands
 
 ```bash
 cargo test          # unit + integration (assert_cmd / insta / tempfile)
@@ -82,7 +78,7 @@ cargo deny          # license / dependency policy check
 
 Releases are planned to be signed, checksummed, and shipped with an SBOM.
 
-## Planned Stack
+## Stack
 
 | Area | Choice |
 |------|--------|
@@ -103,7 +99,7 @@ Releases are planned to be signed, checksummed, and shipped with an SBOM.
 | Audience | Developers and CI pipelines that want pre-commit and in-CI security review |
 | Runtime | Cross-platform Rust binary (single crate) |
 | Architecture intent | Git-aware discovery → parallel detector engines → stable fingerprint/dedupe → renderers; sync/stdio; `git` invoked via `std::process::Command` |
-| Deep docs | [PRD](./PRD.md) · [ARCHITECTURE.md](./ARCHITECTURE.md) (implementation still planned) |
+| Deep docs | [PRD](./PRD.md) · [ARCHITECTURE.md](./ARCHITECTURE.md) |
 
 ## License
 

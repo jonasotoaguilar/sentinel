@@ -1,6 +1,6 @@
 # PRD: Sentinel — Pre-commit & CI Security Scanner
 
-Sentinel is a planned cross-platform Rust CLI that scans Git repositories for secrets and vulnerable dependencies before commit or in CI. It gives developers and pipelines a deterministic, reviewable security check with no server, no database, and no mandatory third-party calls — and an opt-in LLM explainer that can add context without ever dictating severity.
+Sentinel is a cross-platform Rust CLI that scans Git repositories for secrets and vulnerable dependencies before commit or in CI. It gives developers and pipelines a deterministic, reviewable security check with no server, no database, and no mandatory third-party calls — and an opt-in LLM explainer that can add context without ever dictating severity.
 
 > **Status: MVP implemented.** This document is the product source of truth for the MVP; the roadmap it names (rules engine, explain adapter, shell completions) is delivered on `main` and archived under `openspec/changes/archive/`.
 
@@ -121,7 +121,7 @@ These are candidate directions for later phases, explicitly not part of the MVP:
 - **More ecosystems**: additional languages, package managers, and advisory sources.
 - **Optional LLM enhancements**: richer explanation modes and source-aware context — still governed by the rule that the LLM never sets severity or blocking.
 
-Each phase is gated on MVP acceptance criteria passing and its own scope decision; nothing above is promised by the MVP.
+Each phase is gated on MVP acceptance criteria passing and its own scope decision; nothing above is promised by the MVP. The MVP roadmap itself — rules engine, explain adapter, shell completions — is delivered and archived under `openspec/changes/archive/2026-10-17-*/`.
 
 ## Checklist
 
