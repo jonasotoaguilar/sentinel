@@ -105,13 +105,14 @@ fn clean_fixtures_exit_zero_with_empty_stdout() {
 }
 
 #[test]
-fn unparseable_fixture_reports_and_warns_once() {
+fn unparseable_fixture_warns_once_and_reports_nothing() {
     let (_dir, root) = temp_repo();
     track_fixture(&root, "broken.js", "broken.js");
     let output = scan_bin(&root).output().unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("RULE-weak-hash"), "stdout: {stdout:?}");
+    // A file that does not parse is skipped rather than guessed at, and the
+    // diagnostic is what keeps it from being silently dropped.
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(
         stderr.matches("rule-fallback").count(),
