@@ -245,6 +245,10 @@ Releases are **not signed with a long-lived key**, deliberately: provenance come
 | Testing | cargo test, assert_cmd, insta, tempfile |
 | CI / releases | GitHub Actions, upload-sarif, cargo-audit/cargo-deny, signed/checksummed/SBOM artifacts |
 
+## User docs
+
+For day-to-day use rather than the design behind it: [Usage](./docs/USAGE.md) (install, first scan, outputs, exit codes, configuration, baseline, cache), [CI](./docs/CI.md) (GitHub Actions, GitLab CI, pre-commit, Docker), [FAQ](./docs/FAQ.md), [Troubleshooting](./docs/TROUBLESHOOTING.md), and [Comparison](./docs/COMPARISON.md) (how Sentinel differs from other scanners). Copy-paste starters live in [examples](./examples/basic-scan/README.md), and clap-generated man pages in [`man/man1`](./man/man1).
+
 ## Details
 
 | Topic | Decision |

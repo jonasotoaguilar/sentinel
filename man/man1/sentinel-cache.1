@@ -1,0 +1,26 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH sentinel-cache 1  "cache " 
+.SH NAME
+sentinel\-cache \- Inspect and empty the XDG advisory cache — the only state this tool keeps. Every destructive subcommand deletes only inside the resolved cache directory (resolved first, containment\-checked, then deleted), never follows symlinks out of it, and reports what it removed
+.SH SYNOPSIS
+\fBsentinel\-cache\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Inspect and empty the XDG advisory cache — the only state this tool keeps. Every destructive subcommand deletes only inside the resolved cache directory (resolved first, containment\-checked, then deleted), never follows symlinks out of it, and reports what it removed
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH SUBCOMMANDS
+.TP
+sentinel\-cache\-path(1)
+Print the resolved cache location to stdout, so the cache can be inspected. Reads nothing and deletes nothing
+.TP
+sentinel\-cache\-clear(1)
+Empty the cache directory and report what was removed: the entry count and the reclaimed bytes. Clearing an empty or missing cache succeeds and reports zero. Refuses rather than guesses when the resolved location looks wrong (empty, the filesystem root, or the current working directory)
+.TP
+sentinel\-cache\-prune(1)
+Remove cache entries not used since the given age and report what was removed. Last use is approximated by the entry\*(Aqs modification time. A prune that removes nothing succeeds and reports zero
+.TP
+sentinel\-cache\-help(1)
+Print this message or the help of the given subcommand(s)

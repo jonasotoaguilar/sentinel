@@ -1,0 +1,74 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH sentinel-scan 1  "scan " 
+.SH NAME
+sentinel\-scan \- Scan the Git repository at `[PATH]` for secrets (default: the cwd)
+.SH SYNOPSIS
+\fBsentinel\-scan\fR [\fB\-\-ci\fR] [\fB\-\-offline\fR] [\fB\-\-explain\fR] [\fB\-\-output\fR] [\fB\-\-exclude\fR] [\fB\-\-report\fR] [\fB\-\-fail\-under\fR] [\fB\-\-baseline\fR] [\fB\-\-no\-cache\fR] [\fB\-\-update\-baseline\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fIPATH\fR] 
+.SH DESCRIPTION
+Scan the Git repository at `[PATH]` for secrets (default: the cwd)
+.SH OPTIONS
+.TP
+\fB\-\-ci\fR
+Run with hermetic (CI) ignore sources: parent, global, and `.git/info/exclude` ambient ignores are disabled
+.TP
+\fB\-\-offline\fR
+Disable network and cache writes; use any\-age cache only
+.TP
+\fB\-\-explain\fR
+Show one advisory line per finding on terminal output. Advisory\-only: never changes findings, severity, ordering, or the exit code, and is forced off under `\-\-ci` and `\-\-offline`
+.TP
+\fB\-\-output\fR \fI<OUTPUT>\fR [default: terminal]
+Report format: terminal, json, or sarif (default terminal)
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+terminal
+.IP \(bu 2
+json
+.IP \(bu 2
+sarif
+.RE
+.TP
+\fB\-\-exclude\fR \fI<GLOB>\fR
+Exclude files matching a glob from the scan. Repeatable; patterns use `.gitignore` semantics and are matched against repo\-relative paths after `.sentinelignore` and config excludes
+.TP
+\fB\-\-report\fR \fI<PATH>\fR
+Write the machine\-readable report to a file instead of stdout
+.TP
+\fB\-\-fail\-under\fR \fI<FAIL_UNDER>\fR
+Lowest severity that makes a completed scan exit 1: `critical`, `high`, `medium`, `low`, or `none` for report\-only (a completed scan always exits 0). Defaults to `low`, so any finding exits 1 — today\*(Aqs behaviour. Also settable as the `fail_under` config key; the flag wins over project config, which wins over user config. Diagnostics, and scans that did not run (exit 2), are unaffected
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+critical
+.IP \(bu 2
+high
+.IP \(bu 2
+medium
+.IP \(bu 2
+low
+.IP \(bu 2
+none
+.RE
+.TP
+\fB\-\-baseline\fR \fI<PATH>\fR
+Path to a JSON baseline file listing accepted finding fingerprints (see `\-\-update\-baseline` for the format). Findings whose baseline key is listed still report — marked `[accepted]` on terminal, `"accepted": true` in JSON, and an external accepted suppression in SARIF — but never count toward `\-\-fail\-under`. A fingerprint in the file matching no current finding warns once as `baseline\-stale`. Also settable as the `baseline` config key; the flag wins over project config, which wins over user config. Relative project\-config values resolve against the repository root, the flag against the invoking directory. Absent entirely, the scan behaves exactly as today
+.TP
+\fB\-\-no\-cache\fR
+Skip the XDG cache entirely: perform no cache reads and no cache writes. Findings are the same as a scan with a warm cache. Under `\-\-offline` the cache is the only source of advisory data, so a no\-cache offline scan degrades to `osv\-unavailable` warnings for every dependency pin while secrets findings still report — the combination is allowed and never exits 2 on its own
+.TP
+\fB\-\-update\-baseline\fR
+Regenerate the baseline file from this scan\*(Aqs findings and report against it: the file the `\-\-baseline` flag or the `baseline` config key names is rewritten with every current finding\*(Aqs fingerprint (sorted, deduplicated), stale entries pruned. The write is reported as `baseline\-updated` on stderr; without any baseline path the scan exits 2. This is the only write the tool performs besides the XDG cache
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+[\fIPATH\fR] [default: .]
+Directory to scan: resolved against the invoking cwd, then the enclosing Git repository is scanned. The project `sentinel.toml` and `.sentinelignore` come from the target\*(Aqs top level, never the caller\*(Aqs, and `\-\-ci` hermeticity applies to the target walk. Defaults to `.`, so `sentinel scan` scans the cwd unchanged

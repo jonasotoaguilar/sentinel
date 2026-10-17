@@ -1,0 +1,18 @@
+# Only scan what matters: generated files, vendored code, and local
+# environment files never carry reviewable findings. Patterns use
+# `.gitignore` semantics and are matched against repo-relative paths,
+# after `.sentinelignore`. Command-line `--exclude` flags add to this
+# list; they never replace it.
+exclude = ["dist/", "vendor/", "*.log", ".env.local"]
+
+# Lowest severity that makes a completed scan exit 1: one of
+# "critical", "high", "medium", "low", or "none" for report-only
+# (a completed scan always exits 0). The default is "low", so any
+# finding exits 1. With "high", the medium findings from the
+# `../basic-scan` example still report but the scan exits 0.
+fail_under = "high"
+
+# Optional: a JSON file of accepted finding fingerprints. Findings it
+# lists still report (marked `[accepted]`) but never count toward
+# `fail_under`. See `../baseline` for the workflow that writes it.
+# baseline = "sentinel-accepted.json"

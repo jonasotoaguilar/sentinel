@@ -51,6 +51,7 @@ tree-sitter-typescript = "0.23"
 
 [dev-dependencies]
 assert_cmd = "2"
+clap_mangen = "0.2"
 insta = "1"
 jsonschema = { version = "0.58.6", default-features = false }
 predicates = "3"

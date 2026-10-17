@@ -1,0 +1,31 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH sentinel 1  "sentinel 0.2.0" 
+.SH NAME
+sentinel \- Scan Git repositories for secrets, vulnerable dependencies, and risky code patterns before commit or in CI
+.SH SYNOPSIS
+\fBsentinel\fR [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Scan Git repositories for secrets, vulnerable dependencies, and risky code patterns before commit or in CI
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+sentinel\-cache(1)
+Inspect and empty the XDG advisory cache — the only state this tool keeps. Every destructive subcommand deletes only inside the resolved cache directory (resolved first, containment\-checked, then deleted), never follows symlinks out of it, and reports what it removed
+.TP
+sentinel\-completions(1)
+Print the shell completion script for `<shell>` to stdout
+.TP
+sentinel\-scan(1)
+Scan the Git repository at `[PATH]` for secrets (default: the cwd)
+.TP
+sentinel\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH VERSION
+v0.2.0
