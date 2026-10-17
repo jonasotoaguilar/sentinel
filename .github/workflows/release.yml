@@ -185,7 +185,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo cyclonedx -vv --all --format json
+          # No --all: this repository has one crate, so asking for "all
+          # workspace members" buys nothing and takes a code path that failed
+          # on a package-ID hash lookup in Cargo.lock. If this step fails
+          # again, the next lines make the failure conclusive in one run
+          # instead of costing another twenty minutes of guessing.
+          cargo --version
+          rustc --version
+          grep -n 'name = "sentinel' Cargo.lock || true
+          cargo cyclonedx -vv --format json
           test -f bom.json
           mv bom.json "dist/sentinel-${TAG}-sbom.json"
           ls -la dist/
