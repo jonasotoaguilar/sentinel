@@ -194,8 +194,12 @@ jobs:
           rustc --version
           grep -n 'name = "sentinel' Cargo.lock || true
           cargo cyclonedx -vv --format json
-          test -f bom.json
-          mv bom.json "dist/sentinel-${TAG}-sbom.json"
+          # cargo-cyclonedx 0.5.9 names its output after the package
+          # (sentinel-scan.cdx.json) rather than bom.json, so the file is
+          # matched by extension. Asserting a name the tool never promised is
+          # what failed three dispatches: the assertion, not the generator.
+          mv *.cdx.json "dist/sentinel-${TAG}-sbom.json"
+          test -f "dist/sentinel-${TAG}-sbom.json"
           ls -la dist/
 
       - name: Create checksums file
