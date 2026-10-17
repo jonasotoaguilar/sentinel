@@ -119,7 +119,6 @@ impl SecretsEngine {
     /// Applies the compiled secrets table to arbitrary text, replacing
     /// every match with [`REDACTION_PLACEHOLDER`]; the shared redaction
     /// pass other engines apply at their own boundary.
-    #[allow(dead_code)] // Consumed by the rules engine in the next work unit of this chain.
     pub fn redact(&self, text: &str) -> String {
         let bytes = text.as_bytes();
         let mut ranges: Vec<(usize, usize)> = Vec::new();

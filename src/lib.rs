@@ -84,6 +84,10 @@ fn run_inner(
     // merge before the deterministic renderer.
     let mut diagnostics = engine.init_diagnostics().to_vec();
     diagnostics.extend(discovery_diagnostics);
+    // The code-rules engine runs per file after secrets; its rule
+    // failures merge into the same diagnostics vector.
+    let rules_engine = crate::engine::rules::RulesEngine::new();
+    diagnostics.extend(rules_engine.init_diagnostics().to_vec());
 
     let scans = files
         .par_iter()
@@ -91,14 +95,22 @@ fn run_inner(
             let path_text = path.to_string_lossy().replace('\\', "/");
             let bytes = std::fs::read(root.join(path))
                 .map_err(|error| Diagnostic::read_failed(&path_text, &error))?;
-            Ok((path_text, engine.scan(&bytes)))
+            let rule_candidates = rules_engine.scan(&path_text, &bytes);
+            Ok((path_text, engine.scan(&bytes), rule_candidates))
         })
         .collect::<Vec<_>>();
 
     let mut findings = Vec::new();
     for scan in scans {
         match scan {
-            Ok((path, candidates)) => findings.extend(normalize::to_findings(&path, candidates)),
+            Ok((path, secret_candidates, rule_candidates)) => {
+                findings.extend(normalize::to_findings(&path, secret_candidates));
+                findings.extend(normalize::to_findings_for(
+                    crate::engine::ENGINE_RULES,
+                    &path,
+                    rule_candidates,
+                ));
+            }
             Err(diagnostic) => diagnostics.push(diagnostic),
         }
     }

@@ -12,5 +12,4 @@ pub const ENGINE: &str = "secrets";
 pub const ENGINE_DEPENDENCY: &str = "dependency";
 
 /// Stable engine identifier for the code-rules detector; part of fingerprints.
-#[allow(dead_code)] // Consumed by the rules wiring in the next work unit of this chain.
 pub const ENGINE_RULES: &str = "rules";
