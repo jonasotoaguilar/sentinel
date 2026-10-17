@@ -2,7 +2,7 @@
 
 Sentinel is a planned cross-platform Rust CLI that scans Git repositories for secrets and vulnerable dependencies before commit or in CI. It gives developers and pipelines a deterministic, reviewable security check with no server, no database, and no mandatory third-party calls — and an opt-in LLM explainer that can add context without ever dictating severity.
 
-> **Status: MVP specification (bootstrap).** No implementation exists yet. This document is the product source of truth for the MVP and the staging ground for later phases; nothing here is shipped functionality.
+> **Status: MVP implemented.** This document is the product source of truth for the MVP; the roadmap it names (rules engine, explain adapter, shell completions) is delivered on `main` and archived under `openspec/changes/archive/`.
 
 ## Quick Path
 
@@ -109,7 +109,7 @@ Sentinel is a planned cross-platform Rust CLI that scans Git repositories for se
 ### Technical Risks
 
 - OSV API pagination/detail-fetch behavior changes (mitigated by cache + tolerant fetch logic).
-- Tree-sitter grammar coverage gaps for real-world JS/TS and Python (mitigated by regex fallbacks and a curated fixture corpus).
+- Tree-sitter grammar coverage gaps for real-world JS/TS and Python (an unparseable file is skipped with one `rule-fallback` diagnostic and no findings; coverage returns once the syntax is repaired; plus a curated fixture corpus).
 - LLM adapter cost/latency (mitigated by opt-in default, strict context limits, and no severity influence).
 - Ignore-file variance across machines (mitigated by hermetic CI behavior).
 
