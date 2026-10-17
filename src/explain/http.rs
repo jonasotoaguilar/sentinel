@@ -57,8 +57,14 @@ impl HttpExplainer {
         }
         // No `https_only` on the agent: loopback HTTP must stay reachable
         // for hermetic tests, so the scheme gate above owns the guarantee.
+        // The proxy is always disabled: honouring `HTTP_PROXY` would tunnel
+        // the bearer token and the redacted payload to a third host.
+        // Redirects are never followed: the contract allows at most one
+        // request per scan, so a 3xx degrades like any other non-success.
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
+            .proxy(None)
+            .max_redirects(0)
             .build();
         Some(Self {
             agent: ureq::Agent::new_with_config(config),
@@ -69,13 +75,14 @@ impl HttpExplainer {
     }
 
     /// Serializes the request body: the findings prefix fitting the count
-    /// and byte budgets, in canonical order. Pure, so budgets are unit
-    /// testable without a network.
+    /// and byte budgets, in canonical order. The byte budget covers the
+    /// whole serialized body that leaves the process — entries, commas,
+    /// and the envelope — never just the entries. Pure, so budgets are
+    /// unit testable without a network.
     fn body(findings: &[Finding]) -> String {
         let mut entries = Vec::new();
-        let mut bytes = 0usize;
         for finding in findings.iter().take(MAX_FINDINGS) {
-            let entry = serde_json::json!({
+            entries.push(serde_json::json!({
                 "id": &finding.id,
                 "rule_id": &finding.rule_id,
                 "severity": finding.severity.to_string(),
@@ -85,13 +92,11 @@ impl HttpExplainer {
                 "snippet": &finding.location.snippet,
                 "message": &finding.message,
                 "evidence": &finding.evidence,
-            });
-            let entry_text = entry.to_string();
-            if bytes + entry_text.len() > MAX_CONTEXT_BYTES {
+            }));
+            if serde_json::json!({ "findings": entries }).to_string().len() > MAX_CONTEXT_BYTES {
+                entries.pop();
                 break;
             }
-            bytes += entry_text.len();
-            entries.push(entry);
         }
         serde_json::json!({ "findings": entries }).to_string()
     }
@@ -127,16 +132,36 @@ impl HttpExplainer {
 }
 
 /// HTTPS everywhere; plain HTTP only for loopback (hermetic tests, no TLS).
+/// Any URL carrying userinfo is refused on every scheme, and the host is
+/// parsed as a host: bracketed IPv6 honours the brackets, otherwise the
+/// authority up to the first colon. A bare `127.0.0.1` prefix inside
+/// userinfo therefore never reads as the host.
 fn is_allowed_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
-    if lower.starts_with("https://") {
+    let (https, rest) = if let Some(rest) = lower.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = lower.strip_prefix("http://") {
+        (false, rest)
+    } else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    if https {
         return true;
     }
-    if let Some(rest) = lower.strip_prefix("http://") {
-        let host = rest.split(['/', ':', '?', '#']).next().unwrap_or("");
-        return host == "localhost" || host == "127.0.0.1" || host == "[::1]";
+    if let Some(inner) = authority.strip_prefix('[') {
+        // Bracketed IPv6: the host ends at `]`, optionally followed by a port.
+        let (host, after) = match inner.split_once(']') {
+            Some(pair) => pair,
+            None => return false,
+        };
+        return host == "::1" && (after.is_empty() || after.starts_with(':'));
     }
-    false
+    let host = authority.split(':').next().unwrap_or("");
+    host == "localhost" || host == "127.0.0.1"
 }
 
 impl Explainer for HttpExplainer {
@@ -261,6 +286,53 @@ mod tests {
             assert!(HttpExplainer::maybe_new(bad, "k").is_none(), "url {bad:?}");
         }
         assert!(HttpExplainer::maybe_new("https://example.com/x", "").is_none());
+    }
+
+    #[test]
+    fn userinfo_urls_are_refused_on_every_scheme() {
+        // The host must be validated as a host, never as a substring of
+        // the authority: the userinfo prefix below looks loopback while
+        // the real host is not.
+        for evil in [
+            "http://127.0.0.1:9@192.168.1.240:38111/explain",
+            "http://localhost:9@192.168.1.240:38111/explain",
+            "http://127.0.0.1:9@127.0.0.1:38111/explain",
+            "http://localhost:9@localhost:38111/explain",
+            "https://user@example.com/x",
+            "https://user:pass@example.com/x",
+            "http://user@127.0.0.1:38111/explain",
+        ] {
+            assert!(
+                HttpExplainer::maybe_new(evil, "k").is_none(),
+                "userinfo url accepted: {evil:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bracketed_ipv6_loopback_is_allowed() {
+        assert!(HttpExplainer::maybe_new("http://[::1]:9/x", "k").is_some());
+        assert!(HttpExplainer::maybe_new("http://[::1]/x", "k").is_some());
+        // An unbracketed or non-loopback IPv6 literal stays refused.
+        for bad in ["http://[::2]:9/x", "http://::1:9/x", "http://[]:9/x"] {
+            assert!(HttpExplainer::maybe_new(bad, "k").is_none(), "url {bad:?}");
+        }
+    }
+
+    #[test]
+    fn serialized_body_never_exceeds_the_byte_cap() {
+        // The cap covers what leaves the process: entries, commas, and
+        // the envelope. A sweep hits every remainder, so any accounting
+        // that forgets the envelope overflows for some snippet length.
+        for len in (0..5000).step_by(13) {
+            let found = vec![finding("id-0", &"x".repeat(len))];
+            let body = HttpExplainer::body(&found);
+            assert!(
+                body.len() <= MAX_CONTEXT_BYTES,
+                "snippet len {len}: on-wire body is {} bytes",
+                body.len()
+            );
+        }
     }
 
     #[test]

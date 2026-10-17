@@ -180,6 +180,29 @@ fn scan_explained(root: &Path, url: &str, args: &[&str]) -> Output {
     cmd.output().unwrap()
 }
 
+/// Runs the binary pointed at the stub endpoint with extra environment
+/// variables (the proxy test points every proxy variable at its double).
+fn scan_explained_with_env(
+    root: &Path,
+    url: &str,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Output {
+    let mut cmd = AssertCommand::cargo_bin("sentinel").unwrap();
+    cmd.arg("scan")
+        .current_dir(root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("HOME", root)
+        .env("SENTINEL_EXPLAIN_URL", url)
+        .env("SENTINEL_EXPLAIN_API_KEY", "test-key");
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    cmd.args(args);
+    cmd.output().unwrap()
+}
+
 fn text_of(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -347,4 +370,189 @@ fn no_http_without_flag_or_under_ci_or_offline() {
         0,
         "forced-off performs no HTTP"
     );
+}
+
+#[test]
+fn sibling_secrets_on_one_line_are_all_redacted() {
+    let (dir, root) = temp_repo();
+    let line = format!("aws_key = \"{AWS_KEY}\" token = {TOKEN}\n");
+    write_tracked(&root, "env.example", line.as_bytes());
+    let (url, bodies, _count) = stub_server(Respond::Echo);
+    let output = scan_explained(&root, &url, &["--explain"]);
+    assert_eq!(output.status.code(), Some(1));
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1, "exactly one request per scan");
+    let body = text_of(&bodies[0]);
+    assert!(
+        !body.contains(AWS_KEY) && !body.contains(TOKEN),
+        "a sibling secret left the process: {body}"
+    );
+    assert!(
+        body.contains("[REDACTED]"),
+        "context still describes findings"
+    );
+    assert!(!text_of(&output.stdout).contains(AWS_KEY));
+    assert!(!text_of(&output.stdout).contains(TOKEN));
+    assert!(!text_of(&output.stderr).contains(AWS_KEY));
+    assert!(!text_of(&output.stderr).contains(TOKEN));
+    drop(dir);
+}
+
+#[test]
+fn secrets_in_file_and_dir_names_are_redacted() {
+    let (dir, root) = temp_repo();
+    let subdir = format!("dir-{TOKEN}");
+    std::fs::create_dir(root.join(&subdir)).unwrap();
+    let name = format!("{subdir}/{AWS_KEY}.txt");
+    write_tracked(&root, &name, format!("token = {TOKEN}\n").as_bytes());
+    let (url, bodies, _count) = stub_server(Respond::Echo);
+    let output = scan_explained(&root, &url, &["--explain"]);
+    assert_eq!(output.status.code(), Some(1));
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1, "exactly one request per scan");
+    let body = text_of(&bodies[0]);
+    assert!(
+        !body.contains(AWS_KEY) && !body.contains(TOKEN),
+        "a secret in a path left the process: {body}"
+    );
+    assert!(
+        body.contains("[REDACTED].txt"),
+        "the redacted path stays useful to a reader: {body}"
+    );
+    assert!(!text_of(&output.stdout).contains(AWS_KEY));
+    assert!(!text_of(&output.stdout).contains(TOKEN));
+    assert!(!text_of(&output.stderr).contains(AWS_KEY));
+    assert!(!text_of(&output.stderr).contains(TOKEN));
+    drop(dir);
+}
+
+#[test]
+fn userinfo_endpoint_is_refused_without_any_request() {
+    let (_dir, root) = secret_repo();
+    let (url, _bodies, count) = stub_server(Respond::Echo);
+    let port = url
+        .strip_prefix("http://127.0.0.1:")
+        .unwrap()
+        .strip_suffix("/explain")
+        .unwrap();
+    // The userinfo prefix looks loopback while the authority is not a
+    // bare loopback host; the real host here is the stub itself, so an
+    // accepted URL would arrive as a request.
+    let evil = format!("http://127.0.0.1:9@127.0.0.1:{port}/explain");
+    let output = scan_explained(&root, &evil, &["--explain"]);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        0,
+        "a URL with userinfo must never be requested"
+    );
+    assert!(advice_lines(&output.stdout).is_empty());
+    assert_eq!(output.stdout, scan(&root, &[]).stdout);
+    let stderr = text_of(&output.stderr);
+    assert_eq!(
+        stderr.matches("explain-skipped").count(),
+        1,
+        "a refused endpoint degrades to explain-skipped: {stderr}"
+    );
+}
+
+#[test]
+fn proxy_environment_is_ignored() {
+    let (_dir, root) = secret_repo();
+    let (endpoint_url, _endpoint_bodies, endpoint_count) = stub_server(Respond::Echo);
+    let (proxy_url, _proxy_bodies, proxy_count) = stub_server(Respond::Echo);
+    let proxy_env = [
+        ("HTTP_PROXY", proxy_url.as_str()),
+        ("HTTPS_PROXY", proxy_url.as_str()),
+        ("ALL_PROXY", proxy_url.as_str()),
+        ("http_proxy", proxy_url.as_str()),
+        ("https_proxy", proxy_url.as_str()),
+        ("all_proxy", proxy_url.as_str()),
+        ("NO_PROXY", "example.invalid"),
+        ("no_proxy", "example.invalid"),
+    ];
+    let output = scan_explained_with_env(&root, &endpoint_url, &["--explain"], &proxy_env);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(
+        endpoint_count.load(Ordering::SeqCst),
+        1,
+        "the configured endpoint still receives the single request"
+    );
+    assert_eq!(
+        proxy_count.load(Ordering::SeqCst),
+        0,
+        "no byte may be tunnelled to the proxy"
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(advice_lines(&output.stdout).len(), 2);
+}
+
+#[test]
+fn redirect_is_a_failure_without_a_second_request() {
+    let (_dir, root) = secret_repo();
+    let (target_url, _target_bodies, target_count) = stub_server(Respond::Echo);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let redirect_url = format!(
+        "http://127.0.0.1:{}/explain",
+        listener.local_addr().unwrap().port()
+    );
+    let redirect_count = Arc::new(AtomicUsize::new(0));
+    let kept = Arc::clone(&redirect_count);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            kept.fetch_add(1, Ordering::SeqCst);
+            let _ = read_body(&mut stream);
+            let reply = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(reply.as_bytes());
+        }
+    });
+    let output = scan_explained(&root, &redirect_url, &["--explain"]);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(
+        redirect_count.load(Ordering::SeqCst),
+        1,
+        "the single attempt reaches the endpoint"
+    );
+    assert_eq!(
+        target_count.load(Ordering::SeqCst),
+        0,
+        "the redirect target is never contacted"
+    );
+    assert_eq!(output.status.code(), Some(1), "exit code is untouched");
+    assert_eq!(
+        output.stdout,
+        scan(&root, &[]).stdout,
+        "findings are untouched"
+    );
+    assert!(advice_lines(&output.stdout).is_empty());
+    let stderr = text_of(&output.stderr);
+    assert_eq!(
+        stderr.matches("explain-failed").count(),
+        1,
+        "a redirect degrades like any other non-success: {stderr}"
+    );
+}
+
+#[test]
+fn outbound_body_never_exceeds_the_byte_cap() {
+    // One maximal finding: its entry alone fits the entries-only budget,
+    // but entries plus the envelope exceed 4096 bytes on the wire.
+    let (dir, root) = temp_repo();
+    let line = format!("{} {AWS_KEY}\n", "x".repeat(3780));
+    write_tracked(&root, "env.example", line.as_bytes());
+    let (url, bodies, _count) = stub_server(Respond::Echo);
+    let output = scan_explained(&root, &url, &["--explain"]);
+    assert_eq!(output.status.code(), Some(1), "the finding still reports");
+    assert!(text_of(&output.stdout).contains("SECRET-aws-access-key"));
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1, "exactly one request per scan");
+    assert!(
+        bodies[0].len() <= 4096,
+        "on-wire body is {} bytes, over the cap",
+        bodies[0].len()
+    );
+    drop(dir);
 }

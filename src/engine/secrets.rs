@@ -4,6 +4,8 @@
 //! renamed rules stay resolvable via `deprecated_ids`; candidates carry only
 //! redacted text plus a fixed BLAKE3 digest — raw values never cross it.
 
+use std::sync::OnceLock;
+
 use regex::bytes::Regex;
 
 use crate::finding::{Diagnostic, Severity};
@@ -154,6 +156,15 @@ impl SecretsEngine {
         String::from_utf8_lossy(&out).into_owned()
     }
 
+    /// Applies the curated production table to text that never crosses an
+    /// engine boundary on its own (file paths, finding ids): every secret
+    /// the table knows is replaced, so a secret in a name cannot leave the
+    /// process while the surrounding path stays readable.
+    pub fn redact_production(text: &str) -> String {
+        static TABLE: OnceLock<SecretsEngine> = OnceLock::new();
+        TABLE.get_or_init(SecretsEngine::new).redact(text)
+    }
+
     /// Resolves a rule id or a deprecated alias to its rule.
     #[allow(dead_code)] // Query surface for the renamed-rule scenario; tests.
     pub fn resolve(&self, id: &str) -> Option<&Rule> {
@@ -168,10 +179,28 @@ impl SecretsEngine {
         let mut candidates = Vec::new();
         for rule in &self.rules {
             for matched in rule.regex.find_iter(bytes) {
-                candidates.push(candidate(rule, bytes, matched));
+                candidates.push(self.candidate(rule, bytes, matched));
             }
         }
         candidates
+    }
+
+    /// Builds one candidate through the shared boundary: the matched line
+    /// redacted with the whole table (not just the firing rule), so a
+    /// sibling secret on the same line cannot leak through this snippet.
+    /// The digest stays over the pre-redaction matched bytes.
+    fn candidate(&self, rule: &Rule, bytes: &[u8], matched: regex::bytes::Match) -> Candidate {
+        let (line, column) = locate(bytes, matched.start());
+        Candidate {
+            rule_id: rule.id.to_string(),
+            severity: rule.severity,
+            message: rule.message.to_string(),
+            line,
+            column,
+            snippet: self.redact(&line_text(bytes, matched.start())),
+            evidence: REDACTION_PLACEHOLDER.to_string(),
+            digest: digest_of(&bytes[matched.start()..matched.end()]),
+        }
     }
 }
 
@@ -182,20 +211,6 @@ pub(crate) fn digest_of(matched: &[u8]) -> String {
     input.extend_from_slice(&(matched.len() as u64).to_le_bytes());
     input.extend_from_slice(matched);
     blake3::hash(&input).to_hex().to_string()
-}
-
-fn candidate(rule: &Rule, bytes: &[u8], matched: regex::bytes::Match) -> Candidate {
-    let (line, column) = locate(bytes, matched.start());
-    Candidate {
-        rule_id: rule.id.to_string(),
-        severity: rule.severity,
-        message: rule.message.to_string(),
-        line,
-        column,
-        snippet: redact_line(bytes, matched),
-        evidence: REDACTION_PLACEHOLDER.to_string(),
-        digest: digest_of(&bytes[matched.start()..matched.end()]),
-    }
 }
 
 /// 1-based (line, byte column) of an offset within the input; the shared
@@ -233,36 +248,6 @@ pub(crate) fn line_text(bytes: &[u8], offset: usize) -> String {
         line.pop();
     }
     String::from_utf8_lossy(&line).into_owned()
-}
-
-/// The line containing the match, CR normalized to LF, with every occurrence
-/// of the matched bytes replaced by the placeholder.
-fn redact_line(bytes: &[u8], matched: regex::bytes::Match) -> String {
-    let line = line_text(bytes, matched.start()).into_bytes();
-    let redacted = replace_all(
-        &line,
-        &bytes[matched.start()..matched.end()],
-        REDACTION_PLACEHOLDER.as_bytes(),
-    );
-    String::from_utf8_lossy(&redacted).into_owned()
-}
-
-fn replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
-    if needle.is_empty() {
-        return haystack.to_vec();
-    }
-    let mut out = Vec::with_capacity(haystack.len());
-    let mut rest = haystack;
-    while let Some(position) = rest
-        .windows(needle.len())
-        .position(|window| window == needle)
-    {
-        out.extend_from_slice(&rest[..position]);
-        out.extend_from_slice(replacement);
-        rest = &rest[position + needle.len()..];
-    }
-    out.extend_from_slice(rest);
-    out
 }
 
 #[cfg(test)]
