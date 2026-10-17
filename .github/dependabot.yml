@@ -1,0 +1,24 @@
+version: 2
+updates:
+  # Dependencies are part of this product's security surface: the scanner's own
+  # crates parse untrusted input, so an outdated one is a vulnerability in the
+  # thing that reports vulnerabilities.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Minor and patch updates arrive together, so the review cost is one pull
+      # request a week rather than one per crate.
+      cargo-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
