@@ -220,6 +220,98 @@ pub(crate) struct ScanDeps {
     pub user_config: Option<PathBuf>,
 }
 
+/// The `cache` side command (S6): prints or deletes inside the resolved XDG
+/// cache without entering the scan pipeline. `path` only prints; `clear`
+/// and `prune` resolve the location first, refuse when the process stands
+/// inside it, then delete only inside it — and every success reports the
+/// entry count and reclaimed bytes, so a destructive command never runs
+/// silent. Refusals and I/O failures exit 2 with the reason on stderr.
+fn run_cache(
+    action: &cli::CacheAction,
+    cwd: &Path,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> ExitCode {
+    let verb = match action {
+        cli::CacheAction::Path => "path",
+        cli::CacheAction::Clear => "clear",
+        cli::CacheAction::Prune { .. } => "prune",
+    };
+    let Some(cache) = cache::XdgCache::new() else {
+        let _ = writeln!(
+            stderr,
+            "sentinel: cannot {verb} cache: no cache directory is available on this system"
+        );
+        return ExitCode::from(errors::EXIT_OPERATIONAL);
+    };
+    if matches!(action, cli::CacheAction::Path) {
+        // `location` is `Some` whenever `new` is — this branch only
+        // prints, so there is nothing to refuse or delete.
+        let location = cache.location().unwrap_or_default();
+        if writeln!(stdout, "{}", location.display()).is_err() {
+            let _ = writeln!(stderr, "sentinel: cannot write cache path");
+            return ExitCode::from(errors::EXIT_OPERATIONAL);
+        }
+        return ExitCode::SUCCESS;
+    }
+    // Never remove the directory the process is standing in or anything
+    // above it: a cache root containing the invoking cwd refuses instead
+    // of emptying a directory the user is working in. The destructive
+    // methods below re-check containment per entry; this guards the root.
+    if let Some(location) = cache.location() {
+        let root = location.canonicalize().unwrap_or_else(|_| location.clone());
+        let here = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        if here.starts_with(&root) {
+            let _ = writeln!(
+                stderr,
+                "sentinel: cannot {verb} cache: refusing to delete inside the current working directory ({})",
+                here.display()
+            );
+            return ExitCode::from(errors::EXIT_OPERATIONAL);
+        }
+    }
+    let result = match action {
+        cli::CacheAction::Path => unreachable!("returned above"),
+        cli::CacheAction::Clear => cache.clear(),
+        cli::CacheAction::Prune { older_than } => cache.prune(std::time::Duration::from_secs(
+            older_than.saturating_mul(24 * 3600),
+        )),
+    };
+    let stats = match result {
+        Ok(stats) => stats,
+        Err(error) => {
+            let _ = writeln!(stderr, "sentinel: cannot {verb} cache: {error}");
+            return ExitCode::from(errors::EXIT_OPERATIONAL);
+        }
+    };
+    let noun = if stats.entries == 1 {
+        "entry"
+    } else {
+        "entries"
+    };
+    let root = cache.location().unwrap_or_default();
+    let report = match action {
+        cli::CacheAction::Path => unreachable!("returned above"),
+        cli::CacheAction::Clear => format!(
+            "cleared {} {noun} ({} bytes) from {}",
+            stats.entries,
+            stats.bytes,
+            root.display()
+        ),
+        cli::CacheAction::Prune { older_than } => format!(
+            "pruned {} {noun} older than {older_than} days ({} bytes) from {}",
+            stats.entries,
+            stats.bytes,
+            root.display()
+        ),
+    };
+    if writeln!(stdout, "{report}").is_err() {
+        let _ = writeln!(stderr, "sentinel: cannot write cache {verb} report");
+        return ExitCode::from(errors::EXIT_OPERATIONAL);
+    }
+    ExitCode::SUCCESS
+}
+
 /// The dependency-client seam: the caller injects [`ScanDeps`] — the online
 /// path's OSV client (`None` means offline) and the user-config routing — so
 /// the unreachable-endpoint contract and the hostile-config contract are both
@@ -270,6 +362,11 @@ pub(crate) fn run_with_dep_client(
         clap_complete::generate(*shell, &mut cmd, "sentinel", stdout);
         return ExitCode::SUCCESS;
     }
+    // `cache` is a side command beside `scan`: it never enters the scan
+    // pipeline, so no discovery, network, or repository access happens.
+    if let Command::Cache { action } = &cli.command {
+        return run_cache(action, cwd, stdout, stderr);
+    }
     let Command::Scan {
         ci,
         offline,
@@ -280,6 +377,7 @@ pub(crate) fn run_with_dep_client(
         fail_under,
         baseline,
         update_baseline,
+        no_cache,
         path,
     } = cli.command
     else {
@@ -442,8 +540,15 @@ pub(crate) fn run_with_dep_client(
     }
 
     // Dependency review: after secrets, merge with dedupe_and_sort. OSV/cache
-    // failures degrade to diagnostics (0/1), never Exit 2.
-    let dep_cache = cache::XdgCache::new();
+    // failures degrade to diagnostics (0/1), never Exit 2. `--no-cache`
+    // opts out of every cache read and write by handing the engine no
+    // cache at all, so a no-cache scan reports the same findings as a
+    // warm-cache scan (both consult the network) while touching nothing.
+    let dep_cache = if no_cache {
+        None
+    } else {
+        cache::XdgCache::new()
+    };
     let dep_engine = if offline {
         crate::engine::dependency::DependencyEngine::offline(dep_cache)
     } else {
@@ -644,7 +749,7 @@ fn findings_fail_build(
 
 #[cfg(test)]
 mod tests {
-    use super::{ScanDeps, run_inner, run_with_deps};
+    use super::{ScanDeps, run_inner, run_with_dep_client, run_with_deps};
     use crate::engine::secrets::{RuleSpec, SecretsEngine};
     use crate::finding::Severity;
     use crate::test_util::{temp_repo, write_tracked, write_untracked};
@@ -1045,6 +1150,286 @@ mod tests {
             String::from_utf8(o)
                 .unwrap()
                 .contains("SECRET-synthetic-token")
+        );
+    }
+
+    /// `cache path` prints the resolved location and nothing else: the
+    /// only state the tool keeps becomes visible without touching it.
+    #[test]
+    fn cache_path_prints_the_resolved_location() {
+        let Some(cache) = crate::cache::XdgCache::new() else {
+            let (code, out, err) = run_scan(&["cache", "path"], Path::new("."));
+            assert_eq!(code, ExitCode::from(2));
+            assert!(out.is_empty());
+            assert!(!err.is_empty());
+            return;
+        };
+        let expected = format!("{}\n", cache.location().unwrap().display());
+        let (code, out, err) = run_scan(&["cache", "path"], Path::new("."));
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+        assert!(err.is_empty(), "printing the path warns about nothing");
+    }
+
+    /// `--no-cache` under `--offline` degrades instead of refusing: the
+    /// cache is the only advisory source offline, so every pin warns as
+    /// `osv-unavailable` while secrets findings still report and fail the
+    /// build. The pin is synthetic-unique, so no real cache could satisfy
+    /// it — the miss proves nothing was read.
+    #[test]
+    fn no_cache_offline_scan_degrades_with_warning() {
+        let (_dir, root) = temp_repo();
+        write_tracked(
+            &root,
+            OsStr::new("requirements.txt"),
+            b"sentinel-nocache-probe==9.9.9\n",
+        );
+        write_tracked(
+            &root,
+            OsStr::new("env.example"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        let (code, out, err) = run_scan(&["scan", "--offline", "--no-cache"], &root);
+        assert_eq!(
+            code,
+            ExitCode::from(1),
+            "secrets findings still fail the build"
+        );
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("SECRET-synthetic-token")
+        );
+        assert!(
+            String::from_utf8(err).unwrap().contains("osv-unavailable"),
+            "the missing advisory source is disclosed, never silent"
+        );
+    }
+
+    /// Runs inside the re-execed child (see below): a private
+    /// `XDG_CACHE_HOME` makes the cache hermetic without racing parallel
+    /// tests over process environment. Two phases share the one re-exec:
+    /// the `cache` CLI rules (`path` prints, empty `prune` succeeds,
+    /// `clear` removes and reports, standing inside refuses), then the
+    /// `--no-cache` rules (no reads, no writes, findings match the
+    /// warm-cache scan, default still reads the cache).
+    fn cache_s6_child_main() {
+        let expected = format!(
+            "{}\n",
+            crate::cache::XdgCache::new()
+                .unwrap()
+                .location()
+                .unwrap()
+                .display()
+        );
+        let run = |args: &[&str], cwd: &Path| {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = run_inner(&SecretsEngine::new(), &args, cwd, &mut out, &mut err, None);
+            (code, out, err)
+        };
+        let here = std::env::current_dir().unwrap();
+        let (code, out, err) = run(&["cache", "path"], &here);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+        assert!(err.is_empty());
+        // Prune with nothing to remove is a success, not an error.
+        let (code, out, err) = run(&["cache", "prune"], &here);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(
+            String::from_utf8(out).unwrap().contains("pruned 0"),
+            "an empty prune reports zero"
+        );
+        assert!(err.is_empty());
+        // Seed one entry, then clear removes it and says what it removed.
+        let cache = crate::cache::XdgCache::new().unwrap();
+        let payload = br#"{"id":"GHSA-1234","summary":"t"}"#.to_vec();
+        assert!(cache.put("npm", "lodash", "4.17.20", &payload).unwrap());
+        let entry_dir = cache
+            .location()
+            .unwrap()
+            .join("osv")
+            .join("v1")
+            .join("npm")
+            .join("lodash");
+        assert!(entry_dir.exists());
+        let (code, out, err) = run(&["cache", "clear"], &here);
+        assert_eq!(code, ExitCode::SUCCESS);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("cleared 1 entry") && text.contains(&payload.len().to_string()),
+            "clear reports the entry count and bytes: {text:?}"
+        );
+        assert!(err.is_empty());
+        assert!(!entry_dir.exists(), "the entry is gone");
+        assert!(
+            cache.location().unwrap().exists(),
+            "clear empties the root, never removes it"
+        );
+        // Clearing from inside the cache refuses instead of deleting.
+        assert!(cache.put("npm", "lodash", "4.17.20", &payload).unwrap());
+        let inside = cache.location().unwrap();
+        let (code, out, err) = run(&["cache", "clear"], &inside);
+        assert_eq!(code, ExitCode::from(2), "standing inside refuses");
+        assert!(out.is_empty());
+        assert!(
+            String::from_utf8(err).unwrap().contains("refusing"),
+            "the refusal says why"
+        );
+        assert!(entry_dir.exists(), "the refused clear deletes nothing");
+        // Phase two: the injected OSV client counts its own calls. Seeds
+        // one warm entry, then proves `--no-cache` performs no reads (the
+        // warm entry is ignored — the network is consulted once) and no
+        // writes (the entry bytes are unchanged), while reporting
+        // byte-identical findings to the warm-cache scan.
+        use crate::explain::DisabledExplainer;
+        use crate::osv::client::{OsvApi, Query};
+        use crate::osv::validate::Advisory;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountOsv {
+            calls: std::sync::Arc<AtomicUsize>,
+        }
+        impl OsvApi for CountOsv {
+            fn query_all(
+                &self,
+                _qs: &[Query],
+            ) -> Result<(Vec<Vec<Advisory>>, Vec<crate::finding::Diagnostic>), String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok((
+                    vec![vec![Advisory {
+                        id: "GHSA-NOCACHE-PROBE-1".to_string(),
+                        summary: "synthetic probe advisory".to_string(),
+                        severity: crate::finding::Severity::Critical,
+                    }]],
+                    vec![],
+                ))
+            }
+            fn vuln(&self, _id: &str) -> Result<Advisory, String> {
+                Err("no detail".into())
+            }
+        }
+        let (_dir, root) = temp_repo();
+        write_tracked(
+            &root,
+            OsStr::new("package-lock.json"),
+            r#"{"packages":{"node_modules/lodash":{"version":"4.17.20"}}}"#.as_bytes(),
+        );
+        let cache = crate::cache::XdgCache::new().unwrap();
+        let seed = br#"[{"id":"GHSA-NOCACHE-PROBE-1","summary":"synthetic probe advisory","severity":[{"type":"CVSS_V3","score":"9.8"}]}]"#.to_vec();
+        assert!(cache.put("npm", "lodash", "4.17.20", &seed).unwrap());
+        let entry = cache
+            .location()
+            .unwrap()
+            .join("osv")
+            .join("v1")
+            .join("npm")
+            .join("lodash")
+            .join("4%2E17%2E20.json");
+        let run_scan_with = |args: &[&str], osv: CountOsv| {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = run_with_dep_client(
+                &SecretsEngine::new(),
+                &DisabledExplainer,
+                ScanDeps {
+                    osv: Some(Box::new(osv)),
+                    user_config: None,
+                },
+                &args,
+                &root,
+                &mut out,
+                &mut err,
+            );
+            (code, out, err)
+        };
+        // The stub is moved into the seam, so each probe shares its call
+        // counter through an `Arc` that outlives the move.
+        let warm_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let (warm_code, warm_out, warm_err) = run_scan_with(
+            &["scan"],
+            CountOsv {
+                calls: warm_calls.clone(),
+            },
+        );
+        assert_eq!(
+            warm_code,
+            ExitCode::from(1),
+            "the advisory finding fails the build"
+        );
+        assert!(warm_err.is_empty(), "a warm hit warns about nothing");
+        assert_eq!(
+            warm_calls.load(Ordering::SeqCst),
+            0,
+            "the warm scan serves the entry from cache without dialing out"
+        );
+        let before = std::fs::read(&entry).unwrap();
+        let cold_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let (cold_code, cold_out, cold_err) = run_scan_with(
+            &["scan", "--no-cache"],
+            CountOsv {
+                calls: cold_calls.clone(),
+            },
+        );
+        assert_eq!(
+            cold_calls.load(Ordering::SeqCst),
+            1,
+            "the no-cache scan ignores the warm entry and consults the network once"
+        );
+        assert_eq!((cold_code, cold_err), (warm_code, warm_err.clone()));
+        assert_eq!(
+            cold_out, warm_out,
+            "no-cache findings match the warm-cache scan byte for byte"
+        );
+        assert_eq!(
+            std::fs::read(&entry).unwrap(),
+            before,
+            "the no-cache scan writes nothing back"
+        );
+        // PRESERVE: the scan without the new flag still serves the warm
+        // cache — the opt-out changed nothing about the default path.
+        let default_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let (default_code, default_out, default_err) = run_scan_with(
+            &["scan"],
+            CountOsv {
+                calls: default_calls.clone(),
+            },
+        );
+        assert_eq!(
+            (default_code, default_out, default_err),
+            (warm_code, warm_out, warm_err)
+        );
+        assert_eq!(
+            default_calls.load(Ordering::SeqCst),
+            0,
+            "the default scan still reads the cache"
+        );
+    }
+
+    #[test]
+    fn cache_management_shares_one_isolated_child() {
+        if std::env::var("SENTINEL_CACHE_CHILD").is_ok() {
+            cache_s6_child_main();
+            return;
+        }
+        let xdg = TempDir::new().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("tests::cache_management_shares_one_isolated_child")
+            .env("SENTINEL_CACHE_CHILD", "1")
+            .env("XDG_CACHE_HOME", xdg.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child must complete its cache assertions: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child ran its assertions: {}",
+            String::from_utf8_lossy(&output.stdout)
         );
     }
 

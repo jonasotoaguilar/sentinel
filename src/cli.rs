@@ -1,10 +1,10 @@
-//! Command-line surface: exactly two commands, `sentinel scan` and
-//! `sentinel completions <shell>`.
+//! Command-line surface: exactly three commands, `sentinel scan`,
+//! `sentinel cache <path|clear|prune>`, and `sentinel completions <shell>`.
 //!
 //! clap owns parsing; every rejected invocation is a usage error (stderr
 //! diagnostics, empty stdout, exit 2). `--ci`, `--offline`, `--output`,
 //! `--report`, `--exclude`, `--fail-under`, `--baseline`,
-//! `--update-baseline`, and the advisory-only `--explain`
+//! `--update-baseline`, `--no-cache`, and the advisory-only `--explain`
 //! are the only supported scan options; anything else is rejected, so
 //! positional arguments and unknown flags cannot silently become no-ops. `completions` accepts only
 //! the shells clap_complete generates for this crate.
@@ -23,9 +23,19 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// The two MVP commands (cli-scan spec: command surface).
+/// The three commands (cli-scan spec: command surface, plus S6 cache
+/// management): `scan` does the work, `cache` exposes the only state the
+/// tool keeps, and `completions` prints shell scripts.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Inspect and empty the XDG advisory cache — the only state this tool
+    /// keeps. Every destructive subcommand deletes only inside the resolved
+    /// cache directory (resolved first, containment-checked, then deleted),
+    /// never follows symlinks out of it, and reports what it removed.
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
     /// Print the shell completion script for `<shell>` to stdout.
     ///
     /// A pure side command: no discovery, no scan, no network, no cache,
@@ -88,6 +98,14 @@ pub enum Command {
         /// the scan behaves exactly as today.
         #[arg(long, value_name = "PATH")]
         baseline: Option<PathBuf>,
+        /// Skip the XDG cache entirely: perform no cache reads and no cache
+        /// writes. Findings are the same as a scan with a warm cache. Under
+        /// `--offline` the cache is the only source of advisory data, so a
+        /// no-cache offline scan degrades to `osv-unavailable` warnings for
+        /// every dependency pin while secrets findings still report — the
+        /// combination is allowed and never exits 2 on its own.
+        #[arg(long)]
+        no_cache: bool,
         /// Regenerate the baseline file from this scan's findings and report
         /// against it: the file the `--baseline` flag or the `baseline`
         /// config key names is rewritten with every current finding's
@@ -97,6 +115,34 @@ pub enum Command {
         /// performs besides the XDG cache.
         #[arg(long)]
         update_baseline: bool,
+    },
+}
+
+/// The `cache` subcommands (S6): the XDG advisory cache is the only state
+/// the tool keeps, and these are how a user sees it and clears it. `path`
+/// only prints; `clear` and `prune` delete only inside the resolved cache
+/// directory and report the entry count and bytes they removed — a prune
+/// that removes nothing still exits 0.
+#[derive(Debug, Subcommand)]
+pub enum CacheAction {
+    /// Print the resolved cache location to stdout, so the cache can be
+    /// inspected. Reads nothing and deletes nothing.
+    Path,
+    /// Empty the cache directory and report what was removed: the entry
+    /// count and the reclaimed bytes. Clearing an empty or missing cache
+    /// succeeds and reports zero. Refuses rather than guesses when the
+    /// resolved location looks wrong (empty, the filesystem root, or the
+    /// current working directory).
+    Clear,
+    /// Remove cache entries not used since the given age and report what
+    /// was removed. Last use is approximated by the entry's modification
+    /// time. A prune that removes nothing succeeds and reports zero.
+    Prune {
+        /// Remove entries whose last use is older than this many days.
+        /// Defaults to 30: recent advisory data survives while stale
+        /// entries are reclaimed.
+        #[arg(long, default_value_t = 30, value_name = "DAYS")]
+        older_than: u64,
     },
 }
 
@@ -168,7 +214,7 @@ pub fn parse(args: &[String]) -> Result<Cli, clap::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, FailUnder, parse};
+    use super::{CacheAction, Command, FailUnder, parse};
     use clap::error::ErrorKind;
     fn args(tokens: &[&str]) -> Vec<String> {
         tokens.iter().map(|s| s.to_string()).collect()
@@ -417,6 +463,101 @@ mod tests {
                 }
             ),
             "--update-baseline alone relies on the configured baseline path"
+        );
+    }
+    #[test]
+    fn cache_subcommands_parse() {
+        let cli = parse(&args(&["cache", "path"])).unwrap();
+        assert!(
+            matches!(
+                cli.command,
+                Command::Cache {
+                    action: CacheAction::Path
+                }
+            ),
+            "cache path prints the resolved location"
+        );
+        let cli = parse(&args(&["cache", "clear"])).unwrap();
+        assert!(
+            matches!(
+                cli.command,
+                Command::Cache {
+                    action: CacheAction::Clear
+                }
+            ),
+            "cache clear empties the resolved location"
+        );
+        let cli = parse(&args(&["cache", "prune"])).unwrap();
+        assert!(
+            matches!(
+                cli.command,
+                Command::Cache {
+                    action: CacheAction::Prune { older_than: 30 }
+                }
+            ),
+            "prune defaults to entries unused for 30 days"
+        );
+        let cli = parse(&args(&["cache", "prune", "--older-than", "7"])).unwrap();
+        assert!(
+            matches!(
+                cli.command,
+                Command::Cache {
+                    action: CacheAction::Prune { older_than: 7 }
+                }
+            ),
+            "the prune age is a flag, not a constant"
+        );
+    }
+    #[test]
+    fn cache_requires_a_subcommand() {
+        let err = parse(&args(&["cache"])).unwrap_err();
+        assert!(err.use_stderr(), "bare `cache` is a usage error");
+    }
+    #[test]
+    fn scan_no_cache_defaults_off_and_parses() {
+        let cli = parse(&args(&["scan"])).unwrap();
+        assert!(
+            matches!(
+                cli.command,
+                Command::Scan {
+                    no_cache: false,
+                    ..
+                }
+            ),
+            "scans use the cache unless asked not to"
+        );
+        let cli = parse(&args(&["scan", "--no-cache"])).unwrap();
+        assert!(
+            matches!(cli.command, Command::Scan { no_cache: true, .. }),
+            "--no-cache opts out of every cache read and write"
+        );
+    }
+    #[test]
+    fn top_help_lists_cache_beside_scan_and_completions() {
+        let err = parse(&args(&["--help"])).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        let text = err.render().to_string();
+        assert!(
+            text.contains("cache"),
+            "top-level help must list the cache subcommand: {text:?}"
+        );
+    }
+    #[test]
+    fn scan_help_documents_no_cache() {
+        let err = parse(&args(&["scan", "--help"])).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        assert!(
+            err.render().to_string().contains("no-cache"),
+            "scan help must document the cache opt-out"
+        );
+    }
+    #[test]
+    fn cache_prune_help_documents_the_age_flag() {
+        let err = parse(&args(&["cache", "prune", "--help"])).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        assert!(
+            err.render().to_string().contains("older-than"),
+            "prune help must document the age flag"
         );
     }
     #[test]

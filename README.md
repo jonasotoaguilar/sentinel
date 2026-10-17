@@ -126,6 +126,19 @@ The file is JSON under the same `schema_version` envelope as the JSON report:
 
 Entries are keyed on finding fingerprints with the location removed (engine, rule id, content digest), so a renamed or moved file stays accepted while changed content reports fresh. The same file is selectable as the `baseline` key in `sentinel.toml` (or the user config); the flag wins over project config, which wins over user config. A fingerprint in the file matching no current finding warns once as `baseline-stale` on stderr — a baseline that only grows is a baseline nobody prunes. `--update-baseline` rewrites the file it is given (pruning stale entries) and reports what it wrote as `baseline-updated`; it is the only write the tool performs besides the XDG cache. An unreadable or malformed file warns once as `baseline-invalid` and the scan continues with nothing accepted.
 
+## Cache management
+
+The XDG advisory cache is the only state Sentinel keeps. It is visible and manageable:
+
+- `sentinel cache path` prints the resolved location, so the cache can be inspected.
+- `sentinel cache clear` empties it and reports the removed entry count and reclaimed bytes; clearing an empty or missing cache succeeds and reports zero.
+- `sentinel cache prune` removes entries not used since `--older-than <DAYS>` days (default 30, last use approximated by modification time) and reports what it removed; a prune that removes nothing succeeds and reports zero.
+- `sentinel scan --no-cache` skips the cache entirely — no reads, no writes — and reports the same findings as a scan with a warm cache.
+
+Safety: destructive commands delete only inside the resolved cache directory (resolved first, containment-checked, then deleted), never follow symlinks out of it, never remove the directory the process is standing in or anything above it, and refuse with a clear error when the resolved location looks wrong (empty, the filesystem root, or unavailable).
+
+Under `--offline` the cache is the only source of advisory data, so `sentinel scan --offline --no-cache` degrades to `osv-unavailable` warnings for every dependency pin while secrets findings still report — the combination is allowed and never fails the scan on its own.
+
 ## Quick Start (from source)
 
 Build and run from this repository (`cargo run -- <args>`); the usage below is shipped:
@@ -171,6 +184,14 @@ sentinel scan --explain
 
 # Offline: cache only, warns/skips when advisory data is unavailable
 sentinel scan --offline
+
+# See and manage the XDG advisory cache (the only state Sentinel keeps)
+sentinel cache path
+sentinel cache prune --older-than 7
+sentinel cache clear
+
+# Skip the cache entirely: same findings as a warm-cache scan, no reads, no writes
+sentinel scan --no-cache
 
 # Shell completions (bash, zsh, fish, powershell, elvish)
 eval "$(sentinel completions bash)"
