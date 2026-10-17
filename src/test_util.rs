@@ -1,5 +1,5 @@
 //! Test-only helpers: isolated temporary git repositories. Compiled only in
-//! test builds (integration tests exercise the binary in PR4).
+//! test builds (integration tests exercise the built binary).
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};

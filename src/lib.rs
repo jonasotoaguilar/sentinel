@@ -44,7 +44,7 @@ pub fn run(
 }
 
 /// The pipeline over an explicit engine; tests inject engines containing a
-/// failing rule (task 3.3). Reads and detection run in parallel and are
+/// failing rule. Reads and detection run in parallel and are
 /// collected in file order; normalization sorts by (fingerprint, path, line).
 fn run_inner(
     engine: &SecretsEngine,
@@ -53,7 +53,7 @@ fn run_inner(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> ExitCode {
-    // The HTTP adapter is built once per scan from the environment (D7);
+    // The HTTP adapter is built once per scan from the environment;
     // without both variables the disabled explainer keeps the skip path.
     let http = explain::http::HttpExplainer::from_env();
     let disabled = DisabledExplainer;
@@ -127,9 +127,6 @@ pub(crate) fn apply_findings_budget(
     )
 }
 
-/// The pipeline over an explicit engine and explainer (tests inject the stub,
-/// so no test touches the network). The explainer runs at most once per scan:
-/// only when `--explain` was requested, allowed, and configured.
 /// Whether these args request an offline scan. Lets [`run_with_deps`] skip
 /// building the OSV client entirely on the offline path; pure arg peek, so
 /// the pipeline below keeps the single parse that owns error reporting.
@@ -169,6 +166,10 @@ pub fn run_with_deps(
 /// caller (`None` means offline), so the unreachable-endpoint contract is
 /// testable without a network dial. [`run_with_deps`] is the single caller;
 /// production behaviour is unchanged — same client, same policy, same exit codes.
+///
+/// The pipeline over an explicit engine and explainer (tests inject the stub,
+/// so no test touches the network). The explainer runs at most once per scan:
+/// only when `--explain` was requested, allowed, and configured.
 pub(crate) fn run_with_dep_client(
     engine: &SecretsEngine,
     explainer: &dyn Explainer,
@@ -808,7 +809,7 @@ mod tests {
     /// proves the offline path constructs zero OSV clients.
     fn cold_cache_child_main() {
         use crate::explain::DisabledExplainer;
-        use crate::osv::client::{OsvApi, Query, constructions};
+        use crate::osv::client::{OsvApi, Query, ureq_client_constructions};
         // Why: the contract "network or cache degradation never exits 2" had
         // no test for online plus a cold cache with OSV unreachable, and the
         // endpoint is a constant, so only the injected-client seam can stage it.
@@ -830,7 +831,7 @@ mod tests {
                 Err("synthetic network failure".into())
             }
         }
-        let before = constructions();
+        let before = ureq_client_constructions();
         // Offline first: this path must build no OSV client at all.
         let (_dir, offline_root) = temp_repo();
         write_tracked(
@@ -854,7 +855,7 @@ mod tests {
             "an offline miss degrades, never exits 2"
         );
         assert_eq!(
-            constructions(),
+            ureq_client_constructions(),
             before,
             "an --offline scan constructs zero OSV clients"
         );

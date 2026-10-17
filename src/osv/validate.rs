@@ -11,8 +11,28 @@ pub struct Advisory {
 }
 #[rustfmt::skip] pub fn check_size(b:&[u8])->Result<(),Diagnostic>{if b.len()>MAX_BODY{Err(Diagnostic{code:"advisory-invalid",path:String::new(),rule:String::new(),message:"response too large".into()})}else{Ok(())}}
 #[rustfmt::skip] pub fn is_valid_id(id:&str)->bool{if id.is_empty()||id.len()>128||id.contains('/')||id.contains('\\')||id.contains('\0'){return false;}let l=id.to_ascii_lowercase();if l.contains("..")||l.contains("<script")||l=="nan"{return false;}let mut c=id.chars();match c.next(){Some(x) if x.is_ascii_uppercase()=>{},_=>return false,}for ch in c{if !matches!(ch,'A'..='Z'|'0'..='9'|':'|'.'|'_'|'-'){return false;}}true}
+/// Bounds an advisory summary: drops control characters except newline and tab,
+/// then caps at MAX_SUM bytes on a character boundary. Guarantees bounded,
+/// control-stripped text; it does not redact secrets and does not make the
+/// text single-line or terminal-safe.
 #[rustfmt::skip] pub fn sanitize_summary(s:&str)->String{let mut t:String=s.chars().filter(|c|!c.is_control()||*c=='\n'||*c=='\t').collect();if t.len()>MAX_SUM{t.truncate(t.floor_char_boundary(MAX_SUM));}t}
+/// Maps a CVSS score to a severity: the single source every severity site reads
+/// (dependency findings delegate here, so the thresholds cannot drift). A missing
+/// score, or one at or below zero, maps to High; callers disclose that guess with
+/// an advisory-severity-fallback diagnostic at their own site, never here.
 #[rustfmt::skip] pub fn severity_for(cvss:Option<f64>)->Severity{match cvss{Some(v) if v>=9.0=>Severity::Critical,Some(v) if v>=7.0=>Severity::High,Some(v) if v>=4.0=>Severity::Medium,Some(v) if v>0.0=>Severity::Low,_=>Severity::High}}
+/// Canonical representative CVSS score for a severity: the single inverse of
+/// [`severity_for`], so every Severity-to-score site reads this one table.
+/// Guarantees the fixed representatives Critical 9.8, High 7.5, Medium 5.0,
+/// Low 2.1; it never derives a score from advisory data.
+pub fn cvss_for_severity(severity: Severity) -> f64 {
+    match severity {
+        Severity::Critical => 9.8,
+        Severity::High => 7.5,
+        Severity::Medium => 5.0,
+        Severity::Low => 2.1,
+    }
+}
 #[rustfmt::skip] fn is_vector_score(s:&str)->bool{for p in ["CVSS:3.0/","CVSS:3.1/","CVSS:4.0/"]{if let Some(rest)=s.strip_prefix(p){if rest.is_empty(){return false;}return rest.split('/').all(|seg|!seg.is_empty()&&seg.contains(':'));}}false}
 fn roundup(v: f64) -> f64 {
     let scaled = (v * 100000.0).round() as i64;

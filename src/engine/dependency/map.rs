@@ -2,7 +2,8 @@
 #![allow(dead_code)]
 use crate::{
     engine::dependency::Pin,
-    finding::{Finding, Location, Severity},
+    finding::{Finding, Location},
+    osv::validate::severity_for,
 };
 pub fn fingerprint(pin: &Pin, adv: &str) -> String {
     let mut pay = Vec::new();
@@ -27,13 +28,9 @@ pub fn fingerprint(pin: &Pin, adv: &str) -> String {
     )
 }
 pub fn to_finding(pin: &Pin, adv: &str, summary: &str, cvss: Option<f64>) -> Finding {
-    let sev = match cvss {
-        Some(s) if s >= 9.0 => Severity::Critical,
-        Some(s) if s >= 7.0 => Severity::High,
-        Some(s) if s >= 4.0 => Severity::Medium,
-        Some(s) if s > 0.0 => Severity::Low,
-        _ => Severity::High,
-    };
+    // Single source: the thresholds live in `validate::severity_for`, so this
+    // call site cannot drift from the advisory-validation path.
+    let sev = severity_for(cvss);
     let mut ev: String = summary
         .chars()
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
@@ -63,6 +60,7 @@ pub fn to_finding(pin: &Pin, adv: &str, summary: &str, cvss: Option<f64>) -> Fin
 mod tests {
     use super::*;
     use crate::engine::dependency::{Ecosystem, Pin};
+    use crate::finding::Severity;
     fn pl() -> Pin {
         Pin {
             ecosystem: Ecosystem::Npm,

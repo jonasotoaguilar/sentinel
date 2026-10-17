@@ -11,8 +11,8 @@ use std::path::PathBuf;
 
 /// Exit code for operational failures: usage errors, invalid cwd, git
 /// missing, or not a repository. Findings (1) and clean scans (0) are
-/// returned as `ExitCode::SUCCESS` / `ExitCode::from(1)` by `crate::run`
-/// once the secrets engine lands (PR3).
+/// returned as `ExitCode::SUCCESS` / `ExitCode::from(1)` by [`crate::run`],
+/// which owns the scan pipeline.
 pub const EXIT_OPERATIONAL: u8 = 2;
 
 /// Hard failures that abort the scan. All variants are deterministic.

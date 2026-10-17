@@ -40,7 +40,9 @@ pub trait Explainer {
     fn explain(&self, findings: &[Finding]) -> Result<Vec<Explanation>, ExplainError>;
 }
 
-/// Unconfigured explainer (this unit: always; PR6 builds the HTTP adapter).
+/// Unconfigured explainer: always reports itself as not configured, so the
+/// pipeline emits exactly one `explain-skipped` diagnostic and never calls
+/// [`Explainer::explain`].
 pub struct DisabledExplainer;
 
 impl Explainer for DisabledExplainer {
@@ -54,6 +56,9 @@ impl Explainer for DisabledExplainer {
 /// Sanitizes untrusted advisory text to one terminal-safe line: controls
 /// dropped, newline runs collapsed to a space, trimmed, capped at 500 chars.
 /// The renderer adds the `advice:` prefix, so text can never forge a finding.
+/// Guarantees a single terminal-safe line; it does not redact secrets — a
+/// secret in advisory text reaches the terminal, which is why only finding
+/// ids (never content) should key advisories.
 pub(crate) fn sanitize_advisory(text: &str) -> String {
     let mut out = String::new();
     let mut pending_space = false;
