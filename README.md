@@ -65,6 +65,14 @@ From inside any Git repository:
 sentinel scan
 ```
 
+To check a different checkout without leaving the current directory, pass its path (default `.`, so the command above is unchanged):
+
+```bash
+sentinel scan ../other-repo
+```
+
+The scan obeys the *target's* checkout: its `sentinel.toml`, its `.sentinelignore`, and `--ci` hermeticity all apply at the target, never at the invoking directory.
+
 On a clean checkout the scan reports nothing and exits 0. When there are findings, each one prints as a location line plus its redacted evidence:
 
 ```text
@@ -81,7 +89,7 @@ Secret values are always shown as `[REDACTED]`; what you see is where the findin
 |------|---------|
 | 0 | The scan completed and no finding reached the failure threshold. |
 | 1 | The scan completed and reported a finding at or above the failure threshold. |
-| 2 | The scan did not run: a usage error (unknown flag, `--report` with terminal output, missing subcommand), not inside a Git repository, `git` unavailable, or the report could not be rendered or written. |
+| 2 | The scan did not run: a usage error (unknown flag, `--report` with terminal output, missing subcommand), neither the cwd nor the `[PATH]` target inside a Git repository, `git` unavailable, or the report could not be rendered or written. |
 
 The failure threshold is set with `--fail-under <critical|high|medium|low|none>` (or the `fail_under` key in `sentinel.toml` / the user config; the flag wins over project config, which wins over user config). It names the lowest severity that exits 1: `--fail-under high` fails on high and critical findings and ignores medium and low; `none` is report-only and exits 0 whenever the scan completed. The default is `low`, so any finding exits 1 — today's behaviour.
 
@@ -102,6 +110,9 @@ Build and run from this repository (`cargo run -- <args>`); the usage below is s
 ```bash
 # Scan the current repository (git-aware discovery: tracked + untracked files, ignore-aware)
 sentinel scan
+
+# Scan a different checkout (its own sentinel.toml and .sentinelignore apply)
+sentinel scan ../other-repo
 
 # Hermetic CI scan: ignores parent/global gitignore sources; repository-local rules only
 sentinel scan --ci

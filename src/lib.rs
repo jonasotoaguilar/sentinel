@@ -276,6 +276,7 @@ pub(crate) fn run_with_dep_client(
         explain,
         exclude,
         fail_under,
+        path,
     } = cli.command
     else {
         unreachable!("`Completions` returns above, so only `Scan` reaches here");
@@ -286,7 +287,15 @@ pub(crate) fn run_with_dep_client(
         discovery::Mode::Local
     };
 
-    let discovered = match discovery::Git::new().discover(cwd, mode) {
+    // Scan target (S4): the positional PATH resolves against the invoking
+    // cwd and becomes the discovery root. Everything repository-relative —
+    // the Git top level, the project `sentinel.toml`, `.sentinelignore`,
+    // and `--ci` hermeticity — therefore roots at the *target* checkout,
+    // never the caller's. With the default `.` the target is the cwd, so
+    // today's command is unchanged. `--report` below stays resolved against
+    // the invoking cwd, preserving its existing routing.
+    let target = cwd.join(&path);
+    let discovered = match discovery::Git::new().discover(&target, mode) {
         Ok(discovered) => discovered,
         Err(error) => {
             // Fatal errors carry the invocation directory, which may itself
@@ -756,18 +765,18 @@ mod tests {
     fn unsupported_flag_writes_usage_to_stderr_and_exits_two() {
         // `--help`/`--version` intentionally excluded: they render to stdout
         // and exit 0 (covered below), so only genuinely unknown input stays
-        // a usage error.
-        for args in [&["scan", "file.txt"][..], &["scan", "--nope"][..]] {
-            let (code, out, err) = run_scan(args, Path::new("."));
-            assert_eq!(code, ExitCode::from(2), "args {args:?}");
-            assert!(out.is_empty(), "stdout must stay empty for {args:?}");
-            assert!(
-                String::from_utf8(err)
-                    .unwrap()
-                    .contains("unexpected argument"),
-                "args {args:?}"
-            );
-        }
+        // a usage error. A bare positional is NOT unknown: since S4
+        // `scan [PATH]` scans that directory, `scan file.txt` is a scan
+        // target (covered by the S4 path tests), and only unknown flags
+        // stay usage errors here.
+        let (code, out, err) = run_scan(&["scan", "--nope"], Path::new("."));
+        assert_eq!(code, ExitCode::from(2));
+        assert!(out.is_empty(), "stdout must stay empty");
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("unexpected argument")
+        );
     }
 
     #[test]
@@ -1614,6 +1623,219 @@ mod tests {
         assert!(
             String::from_utf8(err).unwrap().contains("config-invalid"),
             "the warning is still disclosed"
+        );
+    }
+
+    /// Scan-target helpers (S4): a secret-bearing repository scanned from a
+    /// different cwd. The observable is always a finding appearing or
+    /// disappearing, never a file name in the output (L6).
+    fn secret_target_repo() -> (TempDir, PathBuf) {
+        let (dir, root) = temp_repo();
+        write_tracked(
+            &root,
+            OsStr::new("keep.env"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        write_tracked(
+            &root,
+            OsStr::new("skip.log"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        (dir, root)
+    }
+
+    /// A positional PATH scans the target repository instead of the cwd:
+    /// invoked from a clean repository, the target's findings report.
+    #[test]
+    fn scan_path_argument_scans_the_target_repository() {
+        let (_caller_dir, caller_root) = temp_repo();
+        write_tracked(&caller_root, OsStr::new("clean.txt"), b"no secrets");
+        let (_target_dir, target_root) = secret_target_repo();
+        let target = target_root.to_str().unwrap();
+        let (code, out, err) = run_scan(&["scan", target], &caller_root);
+        assert_eq!(code, ExitCode::from(1), "target findings fail the build");
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(out_text.contains("keep.env:1:"), "stdout: {out_text}");
+        assert!(out_text.contains("skip.log:1:"), "stdout: {out_text}");
+        assert!(
+            String::from_utf8(err).unwrap().is_empty(),
+            "no diagnostics on this path"
+        );
+    }
+
+    /// A relative PATH resolves against the invoking cwd: from the parent
+    /// directory, naming the target directory scans that checkout.
+    #[test]
+    fn scan_relative_path_resolves_against_the_invoking_cwd() {
+        let parent = TempDir::new().unwrap();
+        let target_dir = parent.path().join("target");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        crate::test_util::git(&target_dir, ["init", "-q"]);
+        write_tracked(
+            &target_dir,
+            OsStr::new("keep.env"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        let (code, out, _) = run_scan(&["scan", "target"], parent.path());
+        assert_eq!(code, ExitCode::from(1));
+        assert!(
+            String::from_utf8(out).unwrap().contains("keep.env:1:"),
+            "relative PATH must resolve against the invoking cwd"
+        );
+    }
+
+    /// The default is unchanged: with no PATH, the scan covers the cwd — a
+    /// clean caller stays clean even when a secret-bearing checkout exists
+    /// next to it.
+    #[test]
+    fn scan_without_path_still_scans_the_cwd() {
+        let (_caller_dir, caller_root) = temp_repo();
+        write_tracked(&caller_root, OsStr::new("clean.txt"), b"no secrets");
+        let (_target_dir, _target_root) = secret_target_repo();
+        let (code, out, err) = run_scan(&["scan"], &caller_root);
+        assert_eq!(code, ExitCode::SUCCESS, "clean cwd means exit 0");
+        assert!(out.is_empty());
+        assert!(err.is_empty());
+    }
+
+    /// A PATH outside any repository fails exactly like a non-repository
+    /// cwd: exit 2, a clear stderr message, empty stdout.
+    #[test]
+    fn scan_non_repository_path_fails_like_non_repository_cwd() {
+        let plain_dir = TempDir::new().unwrap();
+        let (plain_code, plain_out, plain_err) = run_scan(&["scan"], plain_dir.path());
+        assert_eq!(plain_code, ExitCode::from(2));
+        assert!(plain_out.is_empty());
+        let plain_err = String::from_utf8(plain_err).unwrap();
+        assert!(plain_err.contains("not inside a git repository"));
+
+        let (_dir, root) = temp_repo();
+        let outside = TempDir::new().unwrap();
+        let outside_str = outside.path().to_str().unwrap();
+        let (code, out, err) = run_scan(&["scan", outside_str], &root);
+        assert_eq!(code, ExitCode::from(2), "same exit as a non-repo cwd");
+        assert!(out.is_empty(), "stdout must stay empty");
+        let err_text = String::from_utf8(err).unwrap();
+        assert!(
+            err_text.contains("not inside a git repository"),
+            "same shape of error: {err_text}"
+        );
+    }
+
+    /// The target's project config applies when scanned from elsewhere: a
+    /// `sentinel.toml` in the target excluding a file hides its finding.
+    #[test]
+    fn scan_applies_the_target_project_config() {
+        let (_caller_dir, caller_root) = temp_repo();
+        let (_target_dir, target_root) = secret_target_repo();
+        write_untracked(
+            &target_root,
+            OsStr::new("sentinel.toml"),
+            b"exclude = [\"*.log\"]\n",
+        );
+        let target = target_root.to_str().unwrap();
+        let (code, out, _) = run_scan(&["scan", target], &caller_root);
+        assert_eq!(code, ExitCode::from(1), "one finding remains");
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(out_text.contains("keep.env:1:"), "stdout: {out_text}");
+        assert!(
+            !out_text.contains("skip.log"),
+            "target config excluded: {out_text}"
+        );
+    }
+
+    /// The caller's project config must not leak into the target scan: a
+    /// repository without config reports every finding even when the
+    /// invoking cwd excludes the same pattern.
+    #[test]
+    fn scan_ignores_the_caller_project_config() {
+        let (_caller_dir, caller_root) = temp_repo();
+        write_untracked(
+            &caller_root,
+            OsStr::new("sentinel.toml"),
+            b"exclude = [\"*.log\"]\n",
+        );
+        let (_target_dir, target_root) = secret_target_repo();
+        let target = target_root.to_str().unwrap();
+        let (code, out, err) = run_scan(&["scan", target], &caller_root);
+        assert_eq!(code, ExitCode::from(1));
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(out_text.contains("keep.env:1:"), "stdout: {out_text}");
+        assert!(
+            out_text.contains("skip.log:1:"),
+            "caller config must not hide target findings: {out_text}"
+        );
+        assert!(
+            String::from_utf8(err).unwrap().is_empty(),
+            "the caller config contributes no diagnostics either"
+        );
+    }
+
+    /// The target's `.sentinelignore` applies, and the caller's does not: a
+    /// target-side ignore hides its file while a caller-side ignore naming
+    /// the kept file is ignored.
+    #[test]
+    fn scan_applies_the_target_sentinelignore_not_the_caller_one() {
+        let (_caller_dir, caller_root) = temp_repo();
+        write_untracked(&caller_root, OsStr::new(".sentinelignore"), b"keep.env\n");
+        let (_target_dir, target_root) = temp_repo();
+        write_untracked(&target_root, OsStr::new(".sentinelignore"), b"*.secret\n");
+        write_tracked(
+            &target_root,
+            OsStr::new("keep.env"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        write_tracked(
+            &target_root,
+            OsStr::new("skipped.secret"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        let target = target_root.to_str().unwrap();
+        let (code, out, _) = run_scan(&["scan", target], &caller_root);
+        assert_eq!(code, ExitCode::from(1), "one finding remains");
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(
+            out_text.contains("keep.env:1:"),
+            "caller ignore must not apply: {out_text}"
+        );
+        assert!(
+            !out_text.contains("skipped.secret"),
+            "target ignore applies: {out_text}"
+        );
+    }
+
+    /// `--ci` hermeticity is evaluated at the target: the target's
+    /// `.git/info/exclude` hides an untracked secret locally but not under
+    /// `--ci`, however the scan is invoked.
+    #[test]
+    fn scan_ci_hermeticity_applies_to_the_target() {
+        let (_caller_dir, caller_root) = temp_repo();
+        let (_target_dir, target_root) = temp_repo();
+        write_tracked(
+            &target_root,
+            OsStr::new("keep.env"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        let untracked = target_root.join("skipped.env");
+        std::fs::write(&untracked, b"token = sk-synthetic-1234567890\n").unwrap();
+        let info = target_root.join(".git").join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("exclude"), b"skipped.env\n").unwrap();
+        let target = target_root.to_str().unwrap();
+        let (code, out, _) = run_scan(&["scan", target], &caller_root);
+        assert_eq!(code, ExitCode::from(1));
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(out_text.contains("keep.env:1:"), "stdout: {out_text}");
+        assert!(
+            !out_text.contains("skipped.env"),
+            "local mode honors the target info/exclude: {out_text}"
+        );
+        let (code, out, _) = run_scan(&["scan", "--ci", target], &caller_root);
+        assert_eq!(code, ExitCode::from(1));
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(
+            out_text.contains("skipped.env:1:"),
+            "--ci disables the target info/exclude: {out_text}"
         );
     }
 }
