@@ -6,14 +6,28 @@
 #   sentinel-<tag>-aarch64-apple-darwin.tar.gz       ->  sentinel
 #   sentinel-<tag>-x86_64-pc-windows-msvc.zip        ->  sentinel.exe
 # plus one shared checksum file: sentinel-<tag>-checksums.txt
-# (sha256, verifiable with `sha256sum -c`).
+# (sha256, verifiable with `sha256sum -c`)
+# and one SBOM file: sentinel-<tag>-sbom.json
+# (CycloneDX JSON, generated with `cargo cyclonedx`).
+#
+# Trust (why a stranger can believe the download): every file attached to
+# the Release carries a keyless build-provenance attestation created with
+# `actions/attest-build-provenance`, bound to this workflow's OIDC identity
+# — there is no signing key to rotate and no third-party signing action.
+# The archives additionally carry an SBOM attestation
+# (`actions/attest-sbom`) over the shipped SBOM file, so the dependency
+# list is as verifiable as the bytes. Verify with, e.g.:
+#   gh attestation verify <file> --owner <org-or-user>
+# Checksums stay for the download-and-compare path.
 #
 # Design (deliberate, see the feature doc): a hand-written matrix on native
 # runners, so there is no cross-compilation and no release tooling beyond
-# the official `actions/*` steps and the preinstalled `gh` CLI. Each matrix
-# job builds natively (`cargo build --release`, no `--target`) and labels
-# its archive with the runner's native triple. A single `publish` job then
-# attaches every archive plus the checksums to one Release for the tag.
+# the official `actions/*` steps and the `cargo cyclonedx` subcommand
+# (installed in the job, not a crate dependency). Each matrix job builds
+# natively (`cargo build --release`, no `--target`) and labels its archive
+# with the runner's native triple. A single `publish` job then resolves the
+# tag once, generates the SBOM and checksums, attests every release file,
+# and attaches them all to one Release for the tag.
 
 name: Release
 
@@ -104,24 +118,26 @@ jobs:
     name: publish release
     needs: [build]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    # Attestations are keyless (OIDC): `id-token: write` mints the identity
+    # and `attestations: write` stores the attestation. `contents: write`
+    # (repeated here from the top level so this job's needs read as one
+    # block) publishes the Release. The build jobs above do not attest, so
+    # they keep the top-level `contents: write` only.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       # `gh release create --target <sha>` resolves the commit through git, so this
       # job needs a checkout: its artifacts arrive by download, not by clone.
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Download archives
-        uses: actions/download-artifact@v8
-        with:
-          pattern: release-archive-*
-          merge-multiple: true
-          path: dist
-
-      - name: Create GitHub Release
+      - name: Resolve release tag
+        # One source of truth for every step below: tag pushes use the tag,
+        # exercise runs (workflow_dispatch) use the input or a sha-based name.
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           if [ "${{ github.ref_type }}" = "tag" ]; then
@@ -132,6 +148,49 @@ jobs:
           if [ -z "$TAG" ]; then
             TAG="workflow-test-${GITHUB_SHA::8}"
           fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "Release tag: $TAG"
+
+      - name: Download archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-archive-*
+          merge-multiple: true
+          path: dist
+
+      - name: Install Rust toolchain
+        # Same guard as the build jobs: the SBOM step needs cargo, and must
+        # not depend on the runner image's default toolchain.
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Install cargo-cyclonedx
+        # Pinned (not latest) so the SBOM output cannot change under a
+        # release without a reviewed workflow edit. 0.5.9 is the latest
+        # release verified on crates.io when this was written. This installs
+        # a build-time tool in the job; it is not a crate dependency, so
+        # Cargo.toml and Cargo.lock are untouched.
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Generate SBOM
+        # `cargo cyclonedx` writes bom.json next to Cargo.toml; rename it
+        # into dist/ under the same tag scheme as the other release assets.
+        # JSON (not XML) because actions/attest-sbom requires a
+        # JSON-formatted SBOM file as its predicate.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo cyclonedx --all --format json
+          test -f bom.json
+          mv bom.json "dist/sentinel-${TAG}-sbom.json"
+          ls -la dist/
+
+      - name: Create checksums file
+        # Unchanged format: bare filenames, verifiable with `sha256sum -c`
+        # after downloading the assets into one directory. Split out of the
+        # release step so the attestations below can cover this file too.
+        shell: bash
+        run: |
+          set -euo pipefail
           cd dist
           shopt -s nullglob
           ARCHIVES=(sentinel-*.tar.gz sentinel-*.zip)
@@ -141,6 +200,42 @@ jobs:
           fi
           sha256sum "${ARCHIVES[@]}" > "sentinel-${TAG}-checksums.txt"
           cat "sentinel-${TAG}-checksums.txt"
+
+      - name: Attest build provenance
+        # Keyless provenance for EVERY file attached to the Release
+        # (archives, checksums, SBOM): the glob covers dist/sentinel-*
+        # with no per-file bookkeeping to drift.
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: 'dist/sentinel-*'
+
+      - name: Attest SBOM
+        # Binds the shipped SBOM to the same release files it describes.
+        uses: actions/attest-sbom@v4
+        with:
+          subject-path: 'dist/sentinel-*'
+          sbom-path: 'dist/sentinel-${{ env.TAG }}-sbom.json'
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # TAG comes from the "Resolve release tag" step via $GITHUB_ENV.
+          test -n "$TAG"
+          cd dist
+          shopt -s nullglob
+          ARCHIVES=(sentinel-*.tar.gz sentinel-*.zip)
+          if [ "${#ARCHIVES[@]}" -ne 3 ]; then
+            echo "::error::expected 3 per-target archives, found ${#ARCHIVES[@]}: ${ARCHIVES[*]:-<none>}"
+            exit 1
+          fi
+          CHECKSUMS="sentinel-${TAG}-checksums.txt"
+          SBOM="sentinel-${TAG}-sbom.json"
+          test -f "$CHECKSUMS"
+          test -f "$SBOM"
+          cat "$CHECKSUMS"
           # Exercise runs (workflow_dispatch without a v* tag) land as
           # prereleases so a test never becomes the "latest" release.
           PRE=""
@@ -154,4 +249,4 @@ jobs:
             --generate-notes \
             --target "$GITHUB_SHA" \
             $PRE \
-            "${ARCHIVES[@]}" "sentinel-${TAG}-checksums.txt"
+            "${ARCHIVES[@]}" "$CHECKSUMS" "$SBOM"
