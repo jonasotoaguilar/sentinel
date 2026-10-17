@@ -4,9 +4,16 @@
 //! `XDG_CACHE_HOME`; nothing depends on live network data.
 
 use assert_cmd::Command as AssertCommand;
+use sentinel::osv::client::{OsvApi, OsvTransportPolicy, Query, REQUEST_TIMEOUT, UreqOsvClient};
 use std::ffi::OsStr;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::UNIX_EPOCH;
 use tempfile::TempDir;
 
@@ -438,5 +445,258 @@ fn degraded_scan_carries_incomplete_signal_and_clean_scan_carries_none() {
     assert!(
         log["runs"][0].get("invocations").is_none(),
         "clean sarif stays absent"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S5: the OSV transport policy is deliberate — no proxy from the
+// environment, no redirects — and loopback doubles prove where each
+// request goes. A double counts every request whose path carries
+// `/querybatch` (a followed POST redirect arrives as GET, a proxied POST
+// arrives in absolute form); anything else on loopback (ambient probers
+// send `GET /`) is refused with 404 without counting, so each count pins
+// this test's requests rather than machine traffic.
+// ---------------------------------------------------------------------------
+
+/// What one OSV loopback double answers a batch request with.
+enum OsvRespond {
+    /// One severe synthetic advisory, so the query succeeds with no detail fetch.
+    BatchOk,
+    /// A 302 to a second double's batch URL (the target must see nothing).
+    Redirect(String),
+    /// The proxy double: traps the tunnel or forwarded request so the
+    /// parent can prove traffic reached the proxy instead of the endpoint.
+    ProxyTrap,
+}
+
+/// The batch envelope every double answers success with: one severe
+/// synthetic advisory, so the query succeeds with no detail fetch.
+const BATCH_OK_BODY: &str = r#"{"results":[{"vulns":[{"id":"GHSA-TEST-0001","summary":"synthetic","severity":[{"type":"CVSS_V3","score":"9.8"}]}]}]}"#;
+
+fn batch_ok_reply() -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BATCH_OK_BODY}",
+        BATCH_OK_BODY.len()
+    )
+}
+
+/// Answers one connection to the proxy double: ureq tunnels every proxied
+/// request through CONNECT, so the tunnel itself is the routing evidence.
+/// The tunnel is established and the inner batch POST answered on the same
+/// connection, so a query that honours the proxy completes *through* the
+/// proxy — proving the proxy changed where the request goes instead of
+/// merely breaking it. Anything else is refused without counting.
+fn proxy_trap(stream: &mut TcpStream, posts: &Arc<AtomicUsize>) {
+    let (method, path, _) = osv_read_request(stream);
+    if method == "CONNECT" {
+        posts.fetch_add(1, Ordering::SeqCst);
+        let _ =
+            stream.write_all(b"HTTP/1.1 200 Connection established\r\nContent-Length: 0\r\n\r\n");
+        let (_, inner_path, _) = osv_read_request(stream);
+        let reply = if inner_path.contains("/querybatch") {
+            batch_ok_reply()
+        } else {
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+        };
+        let _ = stream.write_all(reply.as_bytes());
+        return;
+    }
+    if method == "POST" && path.contains("/querybatch") {
+        // Absolute-form forwarded POST (a client that forwards without a
+        // tunnel): the same routing evidence.
+        posts.fetch_add(1, Ordering::SeqCst);
+        let _ = stream.write_all(batch_ok_reply().as_bytes());
+        return;
+    }
+    let _ = stream
+        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
+
+/// Spawns a loopback double for the OSV batch endpoint. Returns its batch
+/// URL, its detail base URL, and the batch-request count (the where-it-goes
+/// evidence).
+fn osv_stub(respond: OsvRespond) -> (String, String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let batch = format!("http://127.0.0.1:{port}/querybatch");
+    let vuln = format!("http://127.0.0.1:{port}/vulns/");
+    let posts = Arc::new(AtomicUsize::new(0));
+    let kept = Arc::clone(&posts);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            if matches!(respond, OsvRespond::ProxyTrap) {
+                proxy_trap(&mut stream, &kept);
+                continue;
+            }
+            let (_, path, _) = osv_read_request(&mut stream);
+            if !path.contains("/querybatch") {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
+            kept.fetch_add(1, Ordering::SeqCst);
+            let reply = match &respond {
+                OsvRespond::BatchOk => batch_ok_reply(),
+                OsvRespond::Redirect(target) => format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                ),
+                OsvRespond::ProxyTrap => unreachable!("handled above"),
+            };
+            let _ = stream.write_all(reply.as_bytes());
+        }
+    });
+    (batch, vuln, posts)
+}
+
+/// Reads one HTTP/1.1 request: its method, path, and `Content-Length` body.
+fn osv_read_request(stream: &mut TcpStream) -> (String, String, Vec<u8>) {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+        let Ok(1) = stream.read(&mut byte) else { break };
+        head.push(byte[0]);
+    }
+    let text = String::from_utf8_lossy(&head).into_owned();
+    let mut first = text.lines().next().unwrap_or("").split_whitespace();
+    let method = first.next().unwrap_or("").to_string();
+    let path = first.next().unwrap_or("").to_string();
+    let length = text
+        .lines()
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(str::to_string)
+        })
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0u8; length.min(1 << 20)];
+    let _ = stream.read_exact(&mut body);
+    (method, path, body)
+}
+
+fn osv_query() -> Query {
+    Query {
+        eco: "npm".into(),
+        name: "lodash".into(),
+        ver: "4.17.20".into(),
+    }
+}
+
+fn osv_client(batch: &str, vuln: &str) -> UreqOsvClient {
+    UreqOsvClient::with_policy(OsvTransportPolicy::loopback_for_test(batch, vuln))
+}
+
+#[test]
+fn osv_redirect_target_is_never_contacted() {
+    let (target_batch, _, target_posts) = osv_stub(OsvRespond::BatchOk);
+    let (batch, vuln, batch_posts) = osv_stub(OsvRespond::Redirect(target_batch));
+    let result = osv_client(&batch, &vuln).query_all(&[osv_query()]);
+    assert!(
+        result.is_err(),
+        "a 302 degrades like any other non-success: {result:?}"
+    );
+    assert_eq!(
+        batch_posts.load(Ordering::SeqCst),
+        1,
+        "the single batch POST reaches its endpoint"
+    );
+    assert_eq!(
+        target_posts.load(Ordering::SeqCst),
+        0,
+        "the redirect target is never contacted"
+    );
+}
+
+/// Runs inside the re-execed child (see below): the same test binary, but
+/// the child owns its environment, so no parallel test can observe the
+/// proxy variables. The parent asserts where the requests landed.
+fn osv_proxy_child_main() {
+    let batch = std::env::var("SENTINEL_OSV_TEST_BATCH").unwrap();
+    let vuln = std::env::var("SENTINEL_OSV_TEST_VULN").unwrap();
+    let (advisories, diagnostics) = osv_client(&batch, &vuln).query_all(&[osv_query()]).unwrap();
+    assert_eq!(advisories.len(), 1);
+    assert_eq!(advisories[0].len(), 1);
+    assert_eq!(advisories[0][0].id, "GHSA-TEST-0001");
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn osv_proxy_environment_is_ignored() {
+    // Mutating process environment from a parallel test is a race (and
+    // `std::env::set_var` is `unsafe` in this edition), so the child
+    // process below owns its environment instead: the test binary re-runs
+    // just this test with the proxy variables set.
+    if std::env::var("SENTINEL_OSV_PROXY_CHILD").is_ok() {
+        osv_proxy_child_main();
+        return;
+    }
+    let (batch, vuln, batch_posts) = osv_stub(OsvRespond::BatchOk);
+    let (proxy_batch, _, proxy_posts) = osv_stub(OsvRespond::ProxyTrap);
+    let proxy_origin = proxy_batch.strip_suffix("/querybatch").unwrap().to_string();
+    let exe = std::env::current_exe().unwrap();
+    let output = Command::new(exe)
+        .arg("--exact")
+        .arg("osv_proxy_environment_is_ignored")
+        .env("SENTINEL_OSV_PROXY_CHILD", "1")
+        .env("SENTINEL_OSV_TEST_BATCH", &batch)
+        .env("SENTINEL_OSV_TEST_VULN", &vuln)
+        .env("HTTP_PROXY", &proxy_origin)
+        .env("http_proxy", &proxy_origin)
+        .env("HTTPS_PROXY", &proxy_origin)
+        .env("https_proxy", &proxy_origin)
+        .env("ALL_PROXY", &proxy_origin)
+        .env("all_proxy", &proxy_origin)
+        // Neutralize any ambient exclusion list (CI runners often exclude
+        // loopback), so the proxy variables above are the whole story.
+        .env("NO_PROXY", "example.invalid")
+        .env("no_proxy", "example.invalid")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child must complete its query: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        batch_posts.load(Ordering::SeqCst),
+        1,
+        "the configured endpoint receives the request"
+    );
+    assert_eq!(
+        proxy_posts.load(Ordering::SeqCst),
+        0,
+        "no byte may be tunnelled to the proxy"
+    );
+}
+
+#[test]
+fn osv_production_policy_refuses_plain_http_without_any_request() {
+    // Pins the decided values: `https_only` must never be quietly dropped,
+    // and the proxy/redirect/timeout settings must stay exactly as decided.
+    let production = OsvTransportPolicy::production();
+    assert_eq!(production.batch_url, "https://api.osv.dev/v1/querybatch");
+    assert_eq!(production.vuln_base, "https://api.osv.dev/v1/vulns/");
+    assert_eq!(production.timeout, REQUEST_TIMEOUT);
+    assert!(production.https_only, "HTTPS-only must stay on");
+    assert!(production.proxy.is_none(), "the proxy stays disabled");
+    assert_eq!(production.max_redirects, 0, "redirects stay refused");
+    // A production-policy client pointed at a plain-HTTP double (test-only
+    // endpoint override) must fail before sending anything.
+    let (batch, vuln, posts) = osv_stub(OsvRespond::BatchOk);
+    let mut probed = OsvTransportPolicy::production();
+    probed.batch_url = batch;
+    probed.vuln_base = vuln;
+    let result = UreqOsvClient::with_policy(probed).query_all(&[osv_query()]);
+    assert!(
+        result.is_err(),
+        "plain HTTP under the production policy must fail: {result:?}"
+    );
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        0,
+        "refused before any byte is sent"
     );
 }
