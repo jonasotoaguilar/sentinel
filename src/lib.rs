@@ -16,7 +16,7 @@ mod test_util;
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::CommandFactory;
@@ -27,6 +27,8 @@ use discovery::Discovered;
 use engine::secrets::SecretsEngine;
 use explain::{DisabledExplainer, ExplainError, Explainer};
 use finding::Diagnostic;
+use finding::Finding;
+pub use finding::ScanBudgets;
 
 /// Runs the requested command and returns the process exit code. Usage errors
 /// and operational failures map to exit 2; a completed scan exits 1 with
@@ -60,6 +62,69 @@ fn run_inner(
         None => &disabled,
     };
     run_with_deps(engine, explainer, args, cwd, stdout, stderr)
+}
+
+/// Enforces the file budget on discovery output: the leading files up to
+/// the cap are scanned and the rest is left out with exactly one diagnostic
+/// carrying the omitted count. Discovery order is deterministic, so the kept
+/// prefix — and the report — is byte-identical across reruns.
+pub(crate) fn apply_file_budget(
+    files: Vec<PathBuf>,
+    budgets: &ScanBudgets,
+) -> (Vec<PathBuf>, Option<Diagnostic>) {
+    if files.len() <= budgets.max_files {
+        return (files, None);
+    }
+    let omitted = files.len() - budgets.max_files;
+    let kept: Vec<PathBuf> = files.into_iter().take(budgets.max_files).collect();
+    let kept_count = kept.len();
+    (
+        kept,
+        Some(Diagnostic::scan_files_truncated(kept_count, omitted)),
+    )
+}
+
+/// Splits ordered per-file byte lengths into a kept prefix and the omitted
+/// tail: leading entries whose running total fits the cap are scanned, the
+/// rest is left out. Returns the kept prefix length, the kept bytes, and
+/// the omitted bytes; the omitted file count is `lens.len() - kept`.
+pub(crate) fn byte_budget_split(lens: &[u64], cap: u64) -> (usize, u64, u64) {
+    let mut total = 0u64;
+    let mut kept = 0usize;
+    for len in lens {
+        match total.checked_add(*len) {
+            Some(next) if next <= cap => {
+                total = next;
+                kept += 1;
+            }
+            _ => break,
+        }
+    }
+    let omitted = lens[kept..]
+        .iter()
+        .fold(0u64, |sum, len| sum.saturating_add(*len));
+    (kept, total, omitted)
+}
+
+/// Enforces the findings budget after dedupe and sort: the leading findings
+/// are reported and the rest is left out with exactly one diagnostic
+/// carrying the omitted count. Dedupe and sort are untouched, so order and
+/// rerun identity are unchanged — only the tail is missing, and disclosed.
+pub(crate) fn apply_findings_budget(
+    findings: Vec<Finding>,
+    budgets: &ScanBudgets,
+) -> (Vec<Finding>, Option<Diagnostic>) {
+    if findings.len() <= budgets.max_findings {
+        return (findings, None);
+    }
+    let omitted = findings.len() - budgets.max_findings;
+    let mut kept = findings;
+    kept.truncate(budgets.max_findings);
+    let kept_count = kept.len();
+    (
+        kept,
+        Some(Diagnostic::scan_findings_truncated(kept_count, omitted)),
+    )
 }
 
 /// The pipeline over an explicit engine and explainer (tests inject the stub,
@@ -128,12 +193,18 @@ pub fn run_with_deps(
         files,
         diagnostics: discovery_diagnostics,
     } = discovered;
+    // Total budgets (S7): production values from one documented value.
+    // Each breach degrades through diagnostics; exit codes stay 0/1 and
+    // truncation is never silent.
+    let budgets = ScanBudgets::production();
+    let (files, files_diag) = apply_file_budget(files, &budgets);
 
     // Engine-local rule failures warn once and never abort the scan;
     // discovery diagnostics (skipped-large, walk-failed, invalid-path, ...)
     // merge before the deterministic renderer.
     let mut diagnostics = engine.init_diagnostics().to_vec();
     diagnostics.extend(discovery_diagnostics);
+    diagnostics.extend(files_diag);
     // The code-rules engine runs per file after secrets; its rule
     // failures merge into the same diagnostics vector.
     let rules_engine = crate::engine::rules::RulesEngine::new();
@@ -165,6 +236,7 @@ pub fn run_with_deps(
             // Manifest bytes travel with the scan, so the dependency review
             // below parses these same bytes instead of opening each file
             // a second time.
+            let byte_len = bytes.len() as u64;
             let shared = if raw.ends_with("package-lock.json") || raw.ends_with("requirements.txt")
             {
                 Some((raw, bytes.clone()))
@@ -175,6 +247,7 @@ pub fn run_with_deps(
                 rules_engine.scan_with_diagnostics(&path_text, &bytes);
             Ok((
                 path_text,
+                byte_len,
                 engine.scan(&bytes),
                 rule_candidates,
                 rule_diagnostics,
@@ -183,11 +256,32 @@ pub fn run_with_deps(
         })
         .collect::<Vec<_>>();
 
+    // Byte budget over leading files in deterministic file order: reads that
+    // failed carry no bytes and always keep their diagnostic; successful
+    // reads past the cap leave their findings out and are counted.
+    let ok_lens: Vec<u64> = scans
+        .iter()
+        .filter_map(|scan| scan.as_ref().ok().map(|ok| ok.1))
+        .collect();
+    let (mut kept_ok, kept_bytes, omitted_bytes) =
+        byte_budget_split(&ok_lens, budgets.max_scanned_bytes);
+    let omitted_files = ok_lens.len() - kept_ok;
+    if omitted_files > 0 {
+        diagnostics.push(Diagnostic::scan_bytes_truncated(
+            kept_bytes,
+            omitted_bytes,
+            omitted_files,
+        ));
+    }
     let mut findings = Vec::new();
     let mut manifests: Vec<(String, Vec<u8>)> = Vec::new();
     for scan in scans {
         match scan {
-            Ok((path, secret_candidates, rule_candidates, rule_diagnostics, shared)) => {
+            Ok((path, _, secret_candidates, rule_candidates, rule_diagnostics, shared)) => {
+                if kept_ok == 0 {
+                    continue;
+                }
+                kept_ok -= 1;
                 diagnostics.extend(rule_diagnostics);
                 if let Some(entry) = shared {
                     manifests.push(entry);
@@ -240,6 +334,8 @@ pub fn run_with_deps(
         finding
     }));
     let findings = normalize::dedupe_and_sort(findings);
+    let (findings, findings_diag) = apply_findings_budget(findings, &budgets);
+    diagnostics.extend(findings_diag);
 
     // Opt-in advisories: silent under `--ci`/`--offline` (byte-identical to no
     // flag); one `explain-skipped` when unconfigured; else a single call whose
@@ -713,5 +809,92 @@ mod tests {
         assert_eq!(code, ExitCode::from(2));
         assert!(out.is_empty());
         assert!(String::from_utf8(err).unwrap().contains("Usage"));
+    }
+
+    #[test]
+    fn production_budgets_carry_the_decided_values() {
+        let budgets = crate::finding::ScanBudgets::production();
+        assert_eq!(budgets.max_files, 100_000);
+        assert_eq!(budgets.max_scanned_bytes, 1024 * 1024 * 1024);
+        assert_eq!(budgets.max_findings, 10_000);
+        assert_eq!(budgets.max_pins_per_request, 1_000);
+    }
+
+    #[test]
+    fn file_budget_truncates_with_one_counted_diagnostic() {
+        let budgets = crate::finding::ScanBudgets {
+            max_files: 2,
+            max_scanned_bytes: u64::MAX,
+            max_findings: usize::MAX,
+            max_pins_per_request: 1_000,
+        };
+        let files = vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")];
+        let (kept, diagnostic) = super::apply_file_budget(files, &budgets);
+        assert_eq!(kept.len(), 2);
+        let diagnostic = diagnostic.expect("a file-cap breach must warn");
+        assert_eq!(diagnostic.code, "scan-files-truncated");
+        assert!(
+            diagnostic.message.contains("1 files omitted"),
+            "omitted count must travel: {}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn byte_budget_split_counts_omitted_bytes_and_files() {
+        let budgets = crate::finding::ScanBudgets {
+            max_files: usize::MAX,
+            max_scanned_bytes: 25,
+            max_findings: usize::MAX,
+            max_pins_per_request: 1_000,
+        };
+        let (kept, kept_bytes, omitted_bytes) =
+            super::byte_budget_split(&[10, 10, 10], budgets.max_scanned_bytes);
+        assert_eq!(kept, 2);
+        assert_eq!(kept_bytes, 20);
+        assert_eq!(omitted_bytes, 10);
+        let diagnostic =
+            crate::finding::Diagnostic::scan_bytes_truncated(kept_bytes, omitted_bytes, 1);
+        assert_eq!(diagnostic.code, "scan-bytes-truncated");
+        assert!(
+            diagnostic.message.contains("10"),
+            "omitted bytes must travel: {}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn findings_budget_truncates_with_one_counted_diagnostic() {
+        use crate::finding::{Finding, Location, Severity};
+        let budgets = crate::finding::ScanBudgets {
+            max_files: usize::MAX,
+            max_scanned_bytes: u64::MAX,
+            max_findings: 2,
+            max_pins_per_request: 1_000,
+        };
+        let finding = |id: &str| Finding {
+            id: id.to_string(),
+            engine: "secrets".to_string(),
+            rule_id: "SECRET-x".to_string(),
+            severity: Severity::Medium,
+            location: Location {
+                path: "a.txt".to_string(),
+                line: 1,
+                column: 1,
+                snippet: "[REDACTED]".to_string(),
+            },
+            message: "m".to_string(),
+            evidence: "[REDACTED]".to_string(),
+        };
+        let findings = vec![finding("c"), finding("a"), finding("b")];
+        let (kept, diagnostic) = super::apply_findings_budget(findings, &budgets);
+        assert_eq!(kept.len(), 2);
+        let diagnostic = diagnostic.expect("a findings-cap breach must warn");
+        assert_eq!(diagnostic.code, "scan-findings-truncated");
+        assert!(
+            diagnostic.message.contains("1 findings omitted"),
+            "omitted count must travel: {}",
+            diagnostic.message
+        );
     }
 }
