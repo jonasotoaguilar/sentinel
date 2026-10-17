@@ -30,7 +30,70 @@ Sentinel runs a scan over a Git repository and reports findings in a reviewable 
 - Languages beyond the initial JavaScript/TypeScript and Python rule sets.
 - Any network service, server, or hosted backend.
 
-## Quick Start
+## Install
+
+You do not need a Rust toolchain or a clone to use Sentinel. Pick one of these:
+
+### Release archive (no Rust toolchain needed)
+
+Download the archive for your platform from [the latest release](https://github.com/jonasotoaguilar/sentinel/releases/latest), unpack it, and put the `sentinel` binary on your `PATH`. Each release publishes one archive per supported platform plus a checksums file:
+
+- `sentinel-<tag>-x86_64-unknown-linux-gnu.tar.gz` → `sentinel` (Linux x86_64)
+- `sentinel-<tag>-aarch64-apple-darwin.tar.gz` → `sentinel` (macOS Apple silicon)
+- `sentinel-<tag>-x86_64-pc-windows-msvc.zip` → `sentinel.exe` (Windows x86_64)
+- `sentinel-<tag>-checksums.txt` — sha256 checksums for the archives
+
+Verify a download before running it:
+
+```bash
+sha256sum -c sentinel-<tag>-checksums.txt
+```
+
+### From crates.io (needs a Rust toolchain)
+
+```bash
+cargo install sentinel-scan
+```
+
+The package is called `sentinel-scan` because the name `sentinel` is already taken on crates.io by an unrelated project; the binary it installs is still named `sentinel`, so every `sentinel ...` command below works as written.
+
+## First scan
+
+From inside any Git repository:
+
+```bash
+sentinel scan
+```
+
+On a clean checkout the scan reports nothing and exits 0. When there are findings, each one prints as a location line plus its redacted evidence:
+
+```text
+env.example:1:11: high SECRET-synthetic-token: synthetic test token
+  [REDACTED]
+  evidence: [REDACTED]
+```
+
+Secret values are always shown as `[REDACTED]`; what you see is where the finding is, not the secret itself.
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | The scan completed and found nothing. |
+| 1 | The scan completed and reported findings. |
+| 2 | The scan did not run: a usage error (unknown flag, `--report` with terminal output, missing subcommand), not inside a Git repository, `git` unavailable, or the report could not be rendered or written. |
+
+Diagnostics (warnings such as skipped files or degraded advisory data) go to stderr and never change these codes: a completed scan exits 1 with findings and 0 without them, however many warnings were printed.
+
+## Output formats
+
+- **terminal** (the default): human-friendly output for reading in a terminal, one block per finding. Only stdout content is the report; diagnostics go to stderr, so the report can be redirected safely.
+- **json** (`--output json`): versioned JSON (`schema_version` plus tool name/version and the findings list) for scripts and other tooling to consume.
+- **sarif** (`--output sarif`): SARIF 2.1.0 for CI ingestion, e.g. uploading to GitHub code scanning.
+
+Add `--report <PATH>` (with `json` or `sarif`) to write the machine-readable report to a file instead of stdout.
+
+## Quick Start (from source)
 
 Build and run from this repository (`cargo run -- <args>`); the usage below is shipped:
 
