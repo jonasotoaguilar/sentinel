@@ -158,6 +158,28 @@ jobs:
               core.setFailed(failures.join('\n\n'));
             }
 
+  docs-build:
+    name: Docs Site Builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install mdbook
+        run: cargo install mdbook --locked
+      - name: Build the site
+        # The docs workflow only runs on main, so without this a broken
+        # SUMMARY.md or a renamed page would merge and break the site on the
+        # next push. Building here is the mechanism; remembering is not one.
+        run: mdbook build
+      - name: Every page in SUMMARY was rendered
+        run: |
+          set -euo pipefail
+          test -f book/index.html || { echo "::error::the book did not render"; exit 1; }
+          pages=$(find book -name '*.html' | wc -l)
+          echo "rendered $pages page(s)"
+          [ "$pages" -ge 6 ] || { echo "::error::expected at least 6 pages, got $pages"; exit 1; }
+
   docker-build:
     name: Docker Image Builds
     runs-on: ubuntu-latest

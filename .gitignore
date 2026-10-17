@@ -21,3 +21,5 @@ lcov.info
 clippy.sarif
 .agents
 .claude
+# mdbook build output
+book/
