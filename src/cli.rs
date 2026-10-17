@@ -34,8 +34,15 @@ pub enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
-    /// Scan the current Git repository for secrets.
+    /// Scan the Git repository at `[PATH]` for secrets (default: the cwd).
     Scan {
+        /// Directory to scan: resolved against the invoking cwd, then the
+        /// enclosing Git repository is scanned. The project `sentinel.toml`
+        /// and `.sentinelignore` come from the target's top level, never
+        /// the caller's, and `--ci` hermeticity applies to the target walk.
+        /// Defaults to `.`, so `sentinel scan` scans the cwd unchanged.
+        #[arg(default_value = ".", value_name = "PATH")]
+        path: PathBuf,
         /// Run with hermetic (CI) ignore sources: parent, global, and
         /// `.git/info/exclude` ambient ignores are disabled.
         #[arg(long)]
@@ -180,10 +187,11 @@ mod tests {
     fn unsupported_arguments_are_usage_errors() {
         // `--help`/`--version` intentionally excluded: they render and exit 0
         // (covered below), so only genuinely unknown input stays a usage error.
-        for tokens in [&["scan", "some-file.txt"][..], &["scan", "--nope"][..]] {
-            let err = parse(&args(tokens)).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{tokens:?}");
-        }
+        // A bare positional is NOT unknown: since S4 `scan [PATH]` scans that
+        // directory (covered by the path tests below), only unknown flags
+        // stay usage errors here.
+        let err = parse(&args(&["scan", "--nope"])).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
     }
     #[test]
     fn help_and_version_render_with_exact_program_name() {
@@ -316,6 +324,29 @@ mod tests {
         .unwrap();
         assert!(
             matches!(cli.command, Command::Scan { ref exclude, .. } if exclude == &["*.log".to_string(), "build/".to_string()])
+        );
+    }
+    #[test]
+    fn scan_path_defaults_to_cwd_and_accepts_an_explicit_target() {
+        use std::path::PathBuf;
+        let cli = parse(&args(&["scan"])).unwrap();
+        assert!(
+            matches!(cli.command, Command::Scan { ref path, .. } if path == &PathBuf::from(".")),
+            "no PATH means the invoking cwd"
+        );
+        let cli = parse(&args(&["scan", "../other-repo"])).unwrap();
+        assert!(
+            matches!(cli.command, Command::Scan { ref path, .. } if path == &PathBuf::from("../other-repo")),
+            "an explicit PATH is kept verbatim for cwd-relative resolution"
+        );
+    }
+    #[test]
+    fn scan_help_documents_the_path_argument() {
+        let err = parse(&args(&["scan", "--help"])).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        assert!(
+            err.render().to_string().contains("PATH"),
+            "help must document the scan target"
         );
     }
 }
