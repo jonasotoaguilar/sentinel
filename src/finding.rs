@@ -97,8 +97,9 @@ impl Diagnostic {
         }
     }
 
-    /// A file could not be fully parsed, so only the regions the parser
-    /// recovered were scanned; the scan continues with reduced coverage.
+    /// A file could not be fully parsed, so the file is skipped: no rule
+    /// finding is reported for it, and the gap is disclosed with this one
+    /// diagnostic naming the path.
     pub fn rule_fallback(path: &str, message: &str) -> Self {
         Self {
             code: "rule-fallback",

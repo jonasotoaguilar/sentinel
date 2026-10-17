@@ -210,7 +210,7 @@ All engines share one contract: file or manifest input → zero or more **raw fi
 - **Technology**: Rust, rayon, regex, tree-sitter (JS/TS/Python grammars), serde/toml for manifests.
 - **Scaling**: Rayon `par_iter` over the file set (secrets, rules) and over manifest lists (dependency). Results are collected into plain vectors — parallelism never touches ordering (see Invariants).
 - **Dependencies**: Discovery output; OSV adapter (dependency engine only); normalizer.
-- **Failure modes**: Engine panic or per-file failure → contained (fallback/warn), not propagated.
+- **Failure modes**: Engine panic or per-file failure → contained (skip the file with one diagnostic), not propagated.
 
 ### Normalize / Fingerprint / Dedupe
 
