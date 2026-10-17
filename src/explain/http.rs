@@ -1,0 +1,284 @@
+//! Bounded single-attempt HTTP adapter for [`Explainer`](super::Explainer):
+//! one POST per scan, at most 20 findings and 4096 bytes of redacted
+//! context, a 10-second timeout, no retries. Transport failures become
+//! [`ExplainError::Failed`], malformed bodies [`ExplainError::Invalid`].
+//! Findings arrive already redacted, so nothing re-redacts here. HTTPS is
+//! required; plain HTTP only for loopback (hermetic tests, no TLS).
+
+use std::time::Duration;
+
+use super::{ExplainError, Explainer, Explanation};
+use crate::finding::Finding;
+
+/// At most this many findings travel in the single request, canonical order.
+pub const MAX_FINDINGS: usize = 20;
+/// At most this many serialized bytes of finding context leave the process.
+pub const MAX_CONTEXT_BYTES: usize = 4096;
+/// Per-request timeout (spec: at most 10 seconds).
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cap on the response body, mirroring the OSV client's bound.
+const RESPONSE_LIMIT: u64 = 1024 * 1024;
+const ENV_URL: &str = "SENTINEL_EXPLAIN_URL";
+const ENV_API_KEY: &str = "SENTINEL_EXPLAIN_API_KEY";
+
+/// HTTP [`Explainer`]: a single bounded POST per scan. Built without I/O;
+/// the only request happens inside [`Explainer::explain`], exactly once.
+pub struct HttpExplainer {
+    agent: ureq::Agent,
+    url: String,
+    api_key: String,
+    timeout: Duration,
+}
+
+impl HttpExplainer {
+    /// Builds from explicit values; `None` for an empty value or a
+    /// disallowed endpoint (non-HTTPS outside loopback). Never performs I/O.
+    pub fn maybe_new(url: &str, api_key: &str) -> Option<Self> {
+        Self::with_timeout(url, api_key, REQUEST_TIMEOUT)
+    }
+
+    /// Reads the endpoint and credential once from the environment; `None`
+    /// keeps the pipeline on the disabled explainer (no HTTP). Never I/O.
+    pub fn from_env() -> Option<Self> {
+        let url = std::env::var(ENV_URL).ok()?;
+        let api_key = std::env::var(ENV_API_KEY).ok()?;
+        Self::maybe_new(url.trim(), api_key.trim())
+    }
+
+    /// The configured per-request timeout (the 10-second evidence hook).
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    fn with_timeout(url: &str, api_key: &str, timeout: Duration) -> Option<Self> {
+        let url = url.trim();
+        if url.is_empty() || api_key.is_empty() || !is_allowed_url(url) {
+            return None;
+        }
+        // No `https_only` on the agent: loopback HTTP must stay reachable
+        // for hermetic tests, so the scheme gate above owns the guarantee.
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .build();
+        Some(Self {
+            agent: ureq::Agent::new_with_config(config),
+            url: url.to_string(),
+            api_key: api_key.to_string(),
+            timeout,
+        })
+    }
+
+    /// Serializes the request body: the findings prefix fitting the count
+    /// and byte budgets, in canonical order. Pure, so budgets are unit
+    /// testable without a network.
+    fn body(findings: &[Finding]) -> String {
+        let mut entries = Vec::new();
+        let mut bytes = 0usize;
+        for finding in findings.iter().take(MAX_FINDINGS) {
+            let entry = serde_json::json!({
+                "id": &finding.id,
+                "rule_id": &finding.rule_id,
+                "severity": finding.severity.to_string(),
+                "path": &finding.location.path,
+                "line": finding.location.line,
+                "column": finding.location.column,
+                "snippet": &finding.location.snippet,
+                "message": &finding.message,
+                "evidence": &finding.evidence,
+            });
+            let entry_text = entry.to_string();
+            if bytes + entry_text.len() > MAX_CONTEXT_BYTES {
+                break;
+            }
+            bytes += entry_text.len();
+            entries.push(entry);
+        }
+        serde_json::json!({ "findings": entries }).to_string()
+    }
+
+    /// Parses the response envelope: an array of `{id, text}` objects with
+    /// string fields. Anything else is [`ExplainError::Invalid`]; unknown
+    /// ids travel through and the pipeline drops them. Text passes through
+    /// verbatim: sanitization stays at the renderer boundary.
+    fn parse(text: &str) -> Result<Vec<Explanation>, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|error| error.to_string())?;
+        let items = value
+            .as_array()
+            .ok_or_else(|| "expected an array of {id, text} objects".to_string())?;
+        items
+            .iter()
+            .map(|item| {
+                let id = item
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "entry without a string id".to_string())?;
+                let text = item
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "entry without string text".to_string())?;
+                Ok(Explanation {
+                    finding_id: id.to_string(),
+                    text: text.to_string(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// HTTPS everywhere; plain HTTP only for loopback (hermetic tests, no TLS).
+fn is_allowed_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return true;
+    }
+    if let Some(rest) = lower.strip_prefix("http://") {
+        let host = rest.split(['/', ':', '?', '#']).next().unwrap_or("");
+        return host == "localhost" || host == "127.0.0.1" || host == "[::1]";
+    }
+    false
+}
+
+impl Explainer for HttpExplainer {
+    fn is_configured(&self) -> bool {
+        true
+    }
+
+    fn explain(&self, findings: &[Finding]) -> Result<Vec<Explanation>, ExplainError> {
+        if findings.is_empty() {
+            return Ok(Vec::new());
+        }
+        let authorization = format!("Bearer {}", self.api_key);
+        // A single attempt: every error path below returns without retrying.
+        match self
+            .agent
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", &authorization)
+            .send(Self::body(findings).as_str())
+        {
+            Ok(mut response) if response.status().is_success() => {
+                let text = response
+                    .body_mut()
+                    .with_config()
+                    .limit(RESPONSE_LIMIT)
+                    .read_to_string()
+                    .map_err(|error| ExplainError::Failed(error.to_string()))?;
+                Self::parse(&text).map_err(ExplainError::Invalid)
+            }
+            Ok(response) => Err(ExplainError::Failed(format!(
+                "unexpected status {}",
+                response.status()
+            ))),
+            Err(error) => Err(ExplainError::Failed(error.to_string())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::finding::{Location, Severity};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    fn finding(id: &str, snippet: &str) -> Finding {
+        Finding {
+            id: id.to_string(),
+            engine: "secrets".to_string(),
+            rule_id: "SECRET-synthetic-token".to_string(),
+            severity: Severity::Medium,
+            location: Location {
+                path: "leak.txt".to_string(),
+                line: 1,
+                column: 9,
+                snippet: snippet.to_string(),
+            },
+            message: "synthetic secret token detected".to_string(),
+            evidence: "[REDACTED]".to_string(),
+        }
+    }
+
+    #[test]
+    fn request_body_is_bounded() {
+        // Count budget: 50 findings travel as the first 20, in order.
+        let many: Vec<Finding> = (0..50)
+            .map(|n| finding(&format!("id-{n:02}"), "[REDACTED]"))
+            .collect();
+        let value: serde_json::Value = serde_json::from_str(&HttpExplainer::body(&many)).unwrap();
+        let ids: Vec<&str> = value["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), MAX_FINDINGS);
+        assert_eq!((ids[0], ids[19]), ("id-00", "id-19"));
+        // Byte budget: oversized context truncates to a fitting prefix.
+        let big: Vec<Finding> = (0..5)
+            .map(|n| finding(&format!("id-{n}"), &"x".repeat(1200)))
+            .collect();
+        let value: serde_json::Value = serde_json::from_str(&HttpExplainer::body(&big)).unwrap();
+        let items = value["findings"].as_array().unwrap();
+        assert!(
+            !items.is_empty() && items.len() < 5,
+            "a fitting prefix travels"
+        );
+        assert_eq!(items[0]["id"].as_str().unwrap(), "id-0");
+        let context: usize = items.iter().map(|entry| entry.to_string().len()).sum();
+        assert!(context <= MAX_CONTEXT_BYTES, "context: {context}");
+        assert!(HttpExplainer::body(&[]).contains("[]"));
+    }
+
+    #[test]
+    fn envelope_parses_and_rejects() {
+        let parsed = HttpExplainer::parse(r#"[{"id": "a", "text": "ok"}]"#).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].finding_id, "a");
+        assert_eq!(parsed[0].text, "ok");
+        for bad in [
+            "not json",
+            "{}",
+            "[1]",
+            r#"[{"id": 1, "text": "x"}]"#,
+            r#"[{"id": "a"}]"#,
+        ] {
+            assert!(HttpExplainer::parse(bad).is_err(), "body {bad:?}");
+        }
+    }
+
+    #[test]
+    fn non_https_urls_refused_outside_loopback() {
+        assert!(HttpExplainer::maybe_new("https://example.com/x", "k").is_some());
+        assert!(HttpExplainer::maybe_new("http://127.0.0.1:9/x", "k").is_some());
+        assert!(HttpExplainer::maybe_new("http://localhost:9/x", "k").is_some());
+        for bad in [
+            "http://example.com/x",
+            "http://localhost.evil.com/x",
+            "ftp://example.com/x",
+            "",
+        ] {
+            assert!(HttpExplainer::maybe_new(bad, "k").is_none(), "url {bad:?}");
+        }
+        assert!(HttpExplainer::maybe_new("https://example.com/x", "").is_none());
+    }
+
+    #[test]
+    fn default_timeout_is_ten_seconds() {
+        let explainer = HttpExplainer::maybe_new("https://example.com/x", "k").unwrap();
+        assert_eq!(explainer.timeout(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn refused_connection_is_a_single_failed_attempt() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("http://127.0.0.1:{port}/explain");
+        let explainer = HttpExplainer::maybe_new(&url, "k").unwrap();
+        let result = explainer.explain(&[finding("id-0", "[REDACTED]")]);
+        assert!(matches!(result, Err(ExplainError::Failed(_))));
+    }
+}

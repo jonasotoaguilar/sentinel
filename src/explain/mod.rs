@@ -1,10 +1,11 @@
 //! Opt-in advisory explanations (explain-adapter spec): an [`Explainer`] seam
 //! for display-only terminal text that can never influence findings, severity,
-//! ordering, or the exit code. The bounded HTTP adapter is the next unit, so
-//! nothing here performs I/O.
+//! ordering, or the exit code. [`http::HttpExplainer`] is the bounded
+//! single-attempt adapter; nothing here performs I/O by itself.
 
 use crate::finding::Finding;
 
+pub mod http;
 pub mod stub;
 
 pub use stub::StubExplainer;
@@ -18,15 +19,25 @@ pub struct Explanation {
     pub text: String,
 }
 
+/// Why an explanation attempt yielded no advisories; the pipeline maps each
+/// variant to its `explain-*` diagnostic and continues the scan unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExplainError {
+    /// The request failed, timed out, or returned a non-success status.
+    Failed(String),
+    /// The body was unparseable or wrongly shaped.
+    Invalid(String),
+}
+
 /// The advisory seam. The pipeline calls it at most once per scan, only when
 /// `--explain` was requested and allowed; tests inject [`StubExplainer`].
 pub trait Explainer {
     /// Whether the explainer can run. When false the pipeline emits exactly
     /// one `explain-skipped` diagnostic and never calls [`Explainer::explain`].
     fn is_configured(&self) -> bool;
-    /// Returns advisory texts keyed by finding id, or an error message when
-    /// the adapter fails (the scan then continues without advisories).
-    fn explain(&self, findings: &[Finding]) -> Result<Vec<Explanation>, String>;
+    /// Returns advisory texts keyed by finding id. A failure degrades to the
+    /// matching `explain-*` diagnostic, never to a retry or an exit change.
+    fn explain(&self, findings: &[Finding]) -> Result<Vec<Explanation>, ExplainError>;
 }
 
 /// Unconfigured explainer (this unit: always; PR6 builds the HTTP adapter).
@@ -36,7 +47,7 @@ impl Explainer for DisabledExplainer {
     fn is_configured(&self) -> bool {
         false
     }
-    fn explain(&self, _f: &[Finding]) -> Result<Vec<Explanation>, String> {
+    fn explain(&self, _f: &[Finding]) -> Result<Vec<Explanation>, ExplainError> {
         Ok(Vec::new())
     }
 }

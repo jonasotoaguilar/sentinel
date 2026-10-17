@@ -107,6 +107,26 @@ impl Diagnostic {
             message: sanitize(message),
         }
     }
+    /// `--explain` reached a configured adapter but the request failed,
+    /// timed out, or returned a non-success status; the scan continues.
+    pub fn explain_failed(message: &str) -> Self {
+        Self {
+            code: "explain-failed",
+            path: String::new(),
+            rule: String::new(),
+            message: sanitize(message),
+        }
+    }
+    /// `--explain` received a body that is not an array of `{id, text}`
+    /// objects; the scan continues with no advisories.
+    pub fn explain_invalid(message: &str) -> Self {
+        Self {
+            code: "explain-invalid",
+            path: String::new(),
+            rule: String::new(),
+            message: sanitize(message),
+        }
+    }
     /// `--explain` was requested but no explainer is configured; the scan
     /// continues without advisory text and the exit code is unchanged.
     pub fn explain_skipped(message: &str) -> Self {
