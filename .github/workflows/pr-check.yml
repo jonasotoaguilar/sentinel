@@ -55,6 +55,11 @@ jobs:
   # ── issue / label checks ─────────────────────────────────────────────
 
   check-issue-reference:
+    # Dependabot opens its pull requests without an issue and without a
+    # type:* label, neither of which it can create. The exemption is
+    # scoped to the bot: every other pull request still passes both
+    # gates, and every other check still runs for Dependabot.
+    if: github.actor != 'dependabot[bot]'
     name: Check Issue Reference
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -154,6 +159,11 @@ jobs:
             }
 
   check-type-label:
+    # Dependabot opens its pull requests without an issue and without a
+    # type:* label, neither of which it can create. The exemption is
+    # scoped to the bot: every other pull request still passes both
+    # gates, and every other check still runs for Dependabot.
+    if: github.actor != 'dependabot[bot]'
     name: Check PR Has type:* Label
     runs-on: ubuntu-latest
     timeout-minutes: 5
