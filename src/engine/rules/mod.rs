@@ -5,7 +5,9 @@ pub mod javascript;
 pub mod lang;
 pub mod python;
 
+use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tree_sitter::{Language, Parser};
 
@@ -25,6 +27,82 @@ struct Hit {
 /// Matcher over a parsed file: the source bytes plus the tree root.
 /// Matchers only read node text; redaction and digesting stay centralized.
 type Matcher = fn(source: &[u8], root: tree_sitter::Node<'_>) -> Vec<Hit>;
+
+/// Parsers constructed process-wide. Mirrors the OSV client's `CONSTRUCTIONS`
+/// counter: a production-visible count, not a test-only one, incremented
+/// exactly where a `Parser` is built.
+static PARSER_CONSTRUCTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// One thread's reused parser plus the language it is currently set to.
+/// `set_language` deletes and re-copies the whole grammar table, so it
+/// runs only when the language actually changes between files on the
+/// same thread.
+struct ThreadParser {
+    parser: Parser,
+    language: Option<RulesLanguage>,
+}
+
+thread_local! {
+    // One `Parser` per thread: the scan is a rayon `par_iter`, so each
+    // worker thread parses many files over its lifetime and builds at most
+    // one parser for the whole scan. A `Parser` carries mutable parse state
+    // and cannot be shared, but threads never share work here either, so no
+    // pool and no `Mutex` is needed. The grammars stay in their `OnceLock`s;
+    // only the parser itself is per-thread.
+    static THREAD_PARSER: RefCell<Option<ThreadParser>> = const { RefCell::new(None) };
+    // Parsers constructed on the calling thread. A fresh thread starts at
+    // zero, so a reuse probe on a spawned thread is deterministic no matter
+    // what other tests build on other threads in parallel.
+    static THREAD_PARSER_CONSTRUCTIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Number of `Parser`s constructed so far across all threads.
+pub fn parser_constructions() -> usize {
+    PARSER_CONSTRUCTIONS.load(Ordering::SeqCst)
+}
+
+/// Number of `Parser`s constructed so far on the calling thread.
+pub fn thread_parser_constructions() -> usize {
+    THREAD_PARSER_CONSTRUCTIONS.with(|count| count.get())
+}
+
+/// Records one `Parser` construction in both counters.
+fn note_parser_construction() {
+    PARSER_CONSTRUCTIONS.fetch_add(1, Ordering::SeqCst);
+    THREAD_PARSER_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+}
+
+/// Runs `f` on this thread's reused parser, constructing it on first use.
+/// The grammar is installed only when it differs from the parser's current
+/// one: one thread parses files of many languages over its lifetime, and
+/// reinstalling the same grammar would delete and re-copy its tables for
+/// every file. A `None` return means the grammar itself could not be
+/// installed (compiled-in grammars: unreachable in practice); the caller
+/// stays silent, exactly like a per-file parser that rejects its language.
+fn with_thread_parser<R>(language: RulesLanguage, f: impl FnOnce(&mut Parser) -> R) -> Option<R> {
+    THREAD_PARSER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let entry = slot.get_or_insert_with(|| {
+            note_parser_construction();
+            ThreadParser {
+                parser: Parser::new(),
+                language: None,
+            }
+        });
+        if entry.language != Some(language) {
+            if entry.parser.set_language(grammar(language)).is_err() {
+                return None;
+            }
+            entry.language = Some(language);
+        }
+        // The counters' contract, checked where the parser is handed out:
+        // this thread owns a constructed parser, and the process-wide
+        // count covers every thread's constructions.
+        debug_assert!(thread_parser_constructions() >= 1);
+        debug_assert!(parser_constructions() >= thread_parser_constructions());
+        Some(f(&mut entry.parser))
+    })
+}
 
 /// Static rule definition; adding a rule is a table entry plus its matcher.
 #[derive(Clone, Copy)]
@@ -119,13 +197,12 @@ impl RulesEngine {
         {
             return (Vec::new(), Vec::new());
         }
-        let mut parser = Parser::new();
-        if parser.set_language(grammar(language)).is_err() {
+        let Some(tree) = with_thread_parser(language, |parser| parser.parse(bytes, None)) else {
             // Grammars are compiled in and validated at construction;
             // stay silent rather than invent a finding.
             return (Vec::new(), Vec::new());
-        }
-        let Some(tree) = parser.parse(bytes, None) else {
+        };
+        let Some(tree) = tree else {
             return (
                 Vec::new(),
                 vec![Diagnostic::rule_fallback(
@@ -227,6 +304,26 @@ mod tests {
         languages: &[RulesLanguage::JavaScript],
         matches: whole_input,
     };
+
+    #[test]
+    fn one_thread_reuses_a_single_parser() {
+        // A spawned thread starts with no parser, so its per-thread count
+        // is zero regardless of what other tests build on other threads.
+        // Two parses on that thread must construct exactly one parser.
+        std::thread::spawn(|| {
+            let engine = RulesEngine::new();
+            let _ = engine.scan_with_diagnostics("a.js", b"const h = 1;\n");
+            let _ = engine.scan_with_diagnostics("a.js", b"const h = 2;\n");
+            assert_eq!(
+                thread_parser_constructions(),
+                1,
+                "two parses on one thread constructed {} parsers, expected 1",
+                thread_parser_constructions()
+            );
+        })
+        .join()
+        .expect("parser reuse probe thread panicked");
+    }
 
     #[test]
     fn unsupported_files_are_skipped_silently() {

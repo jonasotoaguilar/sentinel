@@ -88,7 +88,7 @@ Releases are planned to be signed, checksummed, and shipped with an SBOM.
 | Files | ignore, regex, Tree-sitter |
 | HTTP (sync) | ureq |
 | Data | serde / serde_json / toml; XDG cache; no database |
-| Errors / logging | anyhow / thiserror / tracing |
+| Errors / logging | thiserror; diagnostics on stderr, no logging framework |
 | Testing | cargo test, assert_cmd, insta, tempfile |
 | CI / releases | GitHub Actions, upload-sarif, cargo-audit/cargo-deny, signed/checksummed/SBOM artifacts |
 

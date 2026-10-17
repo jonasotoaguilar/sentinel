@@ -1,8 +1,8 @@
 //! Typed operational errors and the CLI exit-code contract.
 //!
 //! `thiserror` owns the domain error types (design: "thiserror 0/1/2");
-//! `anyhow` is reserved for binary-orchestration context. Every variant maps
-//! to exit code 2 (operational failure) per the cli-scan spec. Messages never
+//! every variant maps to exit code 2 (operational failure) per the cli-scan
+//! spec. Messages never
 //! embed run-derived data such as timestamps or git's stderr, so diagnostics
 //! stay byte-identical across runs.
 
