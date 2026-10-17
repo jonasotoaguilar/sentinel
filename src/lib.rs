@@ -23,7 +23,7 @@ use std::process::ExitCode;
 use clap::{CommandFactory, error::ErrorKind};
 use rayon::prelude::*;
 
-use cli::{Command, OutputFormat};
+use cli::{Command, FailUnder, OutputFormat};
 use discovery::Discovered;
 use engine::secrets::SecretsEngine;
 use explain::{DisabledExplainer, ExplainError, Explainer};
@@ -32,8 +32,9 @@ use finding::Finding;
 pub use finding::ScanBudgets;
 
 /// Runs the requested command and returns the process exit code. Usage errors
-/// and operational failures map to exit 2; a completed scan exits 1 with
-/// findings and 0 otherwise. The report (or the completion script) is the
+/// and operational failures map to exit 2; a completed scan exits 1 when its
+/// findings reach the `--fail-under` policy (by default, any finding) and 0
+/// otherwise. The report (or the completion script) is the
 /// only stdout content; diagnostics go to stderr.
 pub fn run(
     args: &[String],
@@ -274,6 +275,7 @@ pub(crate) fn run_with_dep_client(
         report,
         explain,
         exclude,
+        fail_under,
     } = cli.command
     else {
         unreachable!("`Completions` returns above, so only `Scan` reaches here");
@@ -302,12 +304,18 @@ pub(crate) fn run_with_dep_client(
         files,
         diagnostics: discovery_diagnostics,
     } = discovered;
-    // Layered excludes (T1): CLI flags, then the project `sentinel.toml`,
-    // then the user-level file at the caller-chosen path — `None` skips it,
-    // which keeps hermetic tests immune to the developer's home directory.
-    // The same merged set applies in both modes, so `--ci` stays hermetic.
-    let (configured_excludes, config_diagnostics) =
-        config::resolve_with(&root, &exclude, user_config);
+    // Layered configuration (T1/T2): CLI values, then the project
+    // `sentinel.toml`, then the user-level file at the caller-chosen path —
+    // `None` skips it, which keeps hermetic tests immune to the developer's
+    // home directory. Excludes union across levels while `fail_under`
+    // overrides; the same merged excludes apply in both modes, so `--ci`
+    // stays hermetic.
+    let (configured, config_diagnostics) =
+        config::resolve_full_with(&root, &exclude, fail_under, user_config);
+    let configured_excludes = configured.excludes;
+    // Exit policy (S3): the winning `fail_under`, or the default (any
+    // finding fails) when no level set it.
+    let policy = configured.fail_under.unwrap_or_default();
     let (files, exclude_diagnostics) =
         discovery::apply_excludes(&root, files, &configured_excludes);
     // Total budgets (S7): production values from one documented value.
@@ -530,10 +538,24 @@ pub(crate) fn run_with_dep_client(
         return ExitCode::from(errors::EXIT_OPERATIONAL);
     }
 
-    if findings.is_empty() {
-        ExitCode::SUCCESS
-    } else {
+    // Exit policy (S3): only findings at or above the threshold fail the
+    // build; `none` is report-only. Scans that did not run already returned
+    // exit 2 above, and diagnostics never reach this decision.
+    if findings_fail_build(&findings, policy) {
         ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Whether a completed scan's findings fail the build under `policy`: at
+/// least one finding at or above the threshold severity. Severity ordering
+/// comes from [`finding::Severity`]'s `Ord`, so the comparison cannot drift
+/// from the finding model; `None` (report-only) never fails.
+fn findings_fail_build(findings: &[Finding], policy: FailUnder) -> bool {
+    match policy.threshold() {
+        Some(minimum) => findings.iter().any(|finding| finding.severity >= minimum),
+        None => false,
     }
 }
 
@@ -1428,5 +1450,170 @@ mod tests {
             assert_eq!(hidden.0, ExitCode::SUCCESS, "args {excluded:?}");
             assert!(hidden.1.is_empty(), "args {excluded:?}");
         }
+    }
+    /// Exit-policy helpers (S3): hermetic in-process scan over an explicit
+    /// user config, plus single-severity fixture repositories.
+    fn run_scan_with_user(
+        args: &[&str],
+        cwd: &Path,
+        user: Option<PathBuf>,
+    ) -> (ExitCode, Vec<u8>, Vec<u8>) {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_inner(&SecretsEngine::new(), &args, cwd, &mut out, &mut err, user);
+        (code, out, err)
+    }
+    /// A repository whose only finding is medium severity: below `high`, at
+    /// `medium`, above `low` — the threshold boundary probe.
+    fn medium_only_repo() -> (TempDir, PathBuf) {
+        let (dir, root) = temp_repo();
+        write_tracked(
+            &root,
+            OsStr::new("token.env"),
+            b"token = sk-synthetic-1234567890\n",
+        );
+        (dir, root)
+    }
+    /// A repository whose only finding is critical severity.
+    fn critical_only_repo() -> (TempDir, PathBuf) {
+        let (dir, root) = temp_repo();
+        let contents = format!("aws_key = \"{AWS_KEY}\"\n");
+        write_tracked(&root, OsStr::new("env.example"), contents.as_bytes());
+        (dir, root)
+    }
+    /// A finding below the threshold exits 0, but the finding still reports:
+    /// the policy gates the exit code, never the report.
+    #[test]
+    fn finding_below_threshold_exits_zero_but_still_reports() {
+        let (_dir, root) = medium_only_repo();
+        let (code, out, err) = run_scan(&["scan", "--fail-under", "high"], &root);
+        assert_eq!(code, ExitCode::SUCCESS, "medium is below high");
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(
+            out_text.contains("SECRET-synthetic-token"),
+            "the finding still reports: {out_text}"
+        );
+        assert!(
+            String::from_utf8(err).unwrap().is_empty(),
+            "no diagnostics on this path"
+        );
+    }
+    /// A finding at or above the threshold exits 1, from either side of the
+    /// boundary: medium at `medium`, critical above `high`.
+    #[test]
+    fn finding_at_or_above_threshold_exits_one() {
+        let (_dir, root) = medium_only_repo();
+        let (code, _, _) = run_scan(&["scan", "--fail-under", "medium"], &root);
+        assert_eq!(code, ExitCode::from(1), "medium is at medium");
+        let (_dir, root) = critical_only_repo();
+        let (code, out, _) = run_scan(&["scan", "--fail-under", "high"], &root);
+        assert_eq!(code, ExitCode::from(1), "critical is above high");
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("SECRET-aws-access-key")
+        );
+    }
+    /// `none` is report-only: findings present, report intact, exit 0.
+    #[test]
+    fn fail_under_none_is_report_only() {
+        let (_dir, root) = secret_repo();
+        let (code, out, _) = run_scan(&["scan", "--fail-under", "none"], &root);
+        assert_eq!(code, ExitCode::SUCCESS, "report-only never fails");
+        let out_text = String::from_utf8(out).unwrap();
+        for id in ["SECRET-aws-access-key", "SECRET-synthetic-token"] {
+            assert!(out_text.contains(id), "still reported: {out_text}");
+        }
+    }
+    /// The default preserves today's behaviour exactly: any finding exits 1,
+    /// even the lowest severity in the system.
+    #[test]
+    fn default_policy_is_any_finding_exits_one() {
+        let (_dir, root) = medium_only_repo();
+        let (code, out, _) = run_scan(&["scan"], &root);
+        assert_eq!(code, ExitCode::from(1), "no flag means any finding fails");
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("SECRET-synthetic-token")
+        );
+    }
+    /// The CLI flag wins over the project config value.
+    #[test]
+    fn cli_fail_under_overrides_project_config() {
+        let (_dir, root) = medium_only_repo();
+        write_untracked(
+            &root,
+            OsStr::new("sentinel.toml"),
+            b"fail_under = \"high\"\n",
+        );
+        let (code, _, _) = run_scan(&["scan"], &root);
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "project high ignores the medium finding"
+        );
+        let (code, _, _) = run_scan(&["scan", "--fail-under", "low"], &root);
+        assert_eq!(code, ExitCode::from(1), "CLI low replaces project high");
+    }
+    /// The project value wins over the user one — and the user level is
+    /// proven effective first, so the override assertion is meaningful.
+    #[test]
+    fn project_fail_under_overrides_user_config() {
+        let (_dir, root) = medium_only_repo();
+        let xdg = TempDir::new().unwrap();
+        let user_file = xdg.path().join("config.toml");
+        std::fs::write(&user_file, b"fail_under = \"low\"\n").unwrap();
+        let (code, _, _) = run_scan_with_user(&["scan"], &root, Some(user_file.clone()));
+        assert_eq!(
+            code,
+            ExitCode::from(1),
+            "user low fails on the medium finding"
+        );
+        write_untracked(
+            &root,
+            OsStr::new("sentinel.toml"),
+            b"fail_under = \"high\"\n",
+        );
+        let (code, _, _) = run_scan_with_user(&["scan"], &root, Some(user_file));
+        assert_eq!(code, ExitCode::SUCCESS, "project high replaces user low");
+    }
+    /// `none` must not weaken the operational exits: a scan that did not run
+    /// still exits 2.
+    #[test]
+    fn fail_under_none_leaves_operational_exits_untouched() {
+        let dir = TempDir::new().unwrap();
+        let (code, out, err) = run_scan(&["scan", "--fail-under", "none"], dir.path());
+        assert_eq!(
+            code,
+            ExitCode::from(2),
+            "no scan ran, so report-only cannot apply"
+        );
+        assert!(out.is_empty());
+        assert!(!err.is_empty());
+    }
+    /// Diagnostics still never affect the exit code under a policy: a bad
+    /// config warns once, the finding still reports, and the threshold alone
+    /// decides the code.
+    #[test]
+    fn diagnostics_still_never_affect_the_exit_code() {
+        let (_dir, root) = medium_only_repo();
+        write_tracked(&root, OsStr::new("sentinel.toml"), b"exclude = [oops\n");
+        let (code, out, err) = run_scan(&["scan", "--fail-under", "high"], &root);
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "medium is below high; the warning changes nothing"
+        );
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("SECRET-synthetic-token"),
+            "the finding still reports"
+        );
+        assert!(
+            String::from_utf8(err).unwrap().contains("config-invalid"),
+            "the warning is still disclosed"
+        );
     }
 }

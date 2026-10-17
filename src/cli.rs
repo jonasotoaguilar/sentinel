@@ -3,14 +3,16 @@
 //!
 //! clap owns parsing; every rejected invocation is a usage error (stderr
 //! diagnostics, empty stdout, exit 2). `--ci`, `--offline`, `--output`,
-//! `--report`, `--exclude`, and the advisory-only `--explain` are the only
-//! supported scan options; anything else is rejected, so positional arguments
-//! and unknown flags cannot silently become no-ops. `completions` accepts only
+//! `--report`, `--exclude`, `--fail-under`, and the advisory-only `--explain`
+//! are the only supported scan options; anything else is rejected, so
+//! positional arguments and unknown flags cannot silently become no-ops. `completions` accepts only
 //! the shells clap_complete generates for this crate.
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
+
+use crate::finding::Severity;
 
 /// Sentinel — deterministic secrets scanner for Git repositories.
 #[derive(Debug, Parser)]
@@ -57,6 +59,14 @@ pub enum Command {
         /// Write the machine-readable report to a file instead of stdout.
         #[arg(long, value_name = "PATH")]
         report: Option<PathBuf>,
+        /// Lowest severity that makes a completed scan exit 1: `critical`,
+        /// `high`, `medium`, `low`, or `none` for report-only (a completed
+        /// scan always exits 0). Defaults to `low`, so any finding exits 1 —
+        /// today's behaviour. Also settable as the `fail_under` config key;
+        /// the flag wins over project config, which wins over user config.
+        /// Diagnostics, and scans that did not run (exit 2), are unaffected.
+        #[arg(long, value_enum)]
+        fail_under: Option<FailUnder>,
     },
 }
 
@@ -66,6 +76,44 @@ pub enum OutputFormat {
     Terminal,
     Json,
     Sarif,
+}
+
+/// The `--fail-under` exit policy (exit-policy spec S3): the lowest severity
+/// that makes a completed scan exit 1. `None` is report-only: a completed
+/// scan always exits 0. Both the flag and the config key are absent by
+/// default, which resolves to `Low` — any finding exits 1, today's
+/// behaviour exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FailUnder {
+    Critical,
+    High,
+    Medium,
+    Low,
+    None,
+}
+
+impl Default for FailUnder {
+    /// Absence means today's behaviour: any finding fails the build.
+    fn default() -> Self {
+        Self::Low
+    }
+}
+
+impl FailUnder {
+    /// The minimum severity that fails the build, or `None` for report-only.
+    /// The ordering reuses [`Severity`]'s `Ord` (`critical > high > medium >
+    /// `low`), so no parallel ranking exists that could drift from the
+    /// finding model.
+    pub fn threshold(self) -> Option<Severity> {
+        match self {
+            Self::Critical => Some(Severity::Critical),
+            Self::High => Some(Severity::High),
+            Self::Medium => Some(Severity::Medium),
+            Self::Low => Some(Severity::Low),
+            Self::None => None,
+        }
+    }
 }
 
 /// Parses the raw argument list. Usage errors return a clap error that the
@@ -90,7 +138,7 @@ pub fn parse(args: &[String]) -> Result<Cli, clap::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, parse};
+    use super::{Command, FailUnder, parse};
     use clap::error::ErrorKind;
     fn args(tokens: &[&str]) -> Vec<String> {
         tokens.iter().map(|s| s.to_string()).collect()
@@ -208,6 +256,47 @@ mod tests {
             let err = parse(&args(tokens)).unwrap_err();
             assert!(err.use_stderr(), "{tokens:?}");
         }
+    }
+    #[test]
+    fn fail_under_flag_parses_each_level_and_defaults_to_absent() {
+        let cli = parse(&args(&["scan"])).unwrap();
+        assert!(
+            matches!(
+                cli.command,
+                Command::Scan {
+                    fail_under: None,
+                    ..
+                }
+            ),
+            "absent flag means no CLI policy"
+        );
+        for (token, level) in [
+            ("critical", FailUnder::Critical),
+            ("high", FailUnder::High),
+            ("medium", FailUnder::Medium),
+            ("low", FailUnder::Low),
+            ("none", FailUnder::None),
+        ] {
+            let cli = parse(&args(&["scan", "--fail-under", token])).unwrap();
+            assert!(
+                matches!(cli.command, Command::Scan { fail_under: Some(found), .. } if found == level),
+                "--fail-under {token} parses to {level:?}"
+            );
+        }
+    }
+    #[test]
+    fn fail_under_rejects_unknown_levels() {
+        let err = parse(&args(&["scan", "--fail-under", "bogus"])).unwrap_err();
+        assert!(err.use_stderr(), "unknown level is a usage error");
+    }
+    #[test]
+    fn scan_help_documents_the_fail_under_flag() {
+        let err = parse(&args(&["scan", "--help"])).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        assert!(
+            err.render().to_string().contains("fail-under"),
+            "help must document the exit-policy flag"
+        );
     }
     #[test]
     fn exclude_flag_is_repeatable_and_defaults_to_empty() {

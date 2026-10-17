@@ -5,9 +5,9 @@
 //! default**. List-valued keys (like `exclude`) **union** across levels:
 //! every level contributes its patterns, concatenated CLI-first with
 //! first-seen dedup, so "CLI beats project beats user" is realized as
-//! order, not replacement. Scalar-valued keys (the next slice's
-//! `fail_under`) **override** instead: CLI wins over project wins over
-//! user. The user level itself resolves from `SENTINEL_CONFIG` when set and
+//! order, not replacement. Scalar-valued keys (`fail_under`) **override**
+//! instead: CLI wins over project wins over user (see [`override_scalar`],
+//! deliberately separate from [`merge_excludes`]). The user level itself resolves from `SENTINEL_CONFIG` when set and
 //! non-empty, otherwise from the XDG lookup below. A missing file at either
 //! level contributes nothing; an unreadable or malformed file contributes
 //! exactly one actionable `config-invalid` diagnostic and never aborts the
@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::cli::FailUnder;
 use crate::finding::Diagnostic;
 
 /// User-level config file name, resolved under the XDG config home.
@@ -30,6 +31,21 @@ struct FileConfig {
     /// Glob patterns (`.gitignore` semantics) removing files from the scan.
     #[serde(default)]
     exclude: Vec<String>,
+    /// Lowest severity that fails the build; `None` (key absent) falls
+    /// through to the next level, it never resets a value set above.
+    #[serde(default)]
+    fail_under: Option<FailUnder>,
+}
+
+/// The effective configuration for one scan: the merged list levels plus the
+/// resolved scalar levels.
+#[derive(Debug, Default)]
+pub(crate) struct ResolvedConfig {
+    /// Union of every level's excludes, CLI-first (see [`merge_excludes`]).
+    pub excludes: Vec<String>,
+    /// The winning `fail_under`, if any level set it; `None` means every
+    /// level was silent and the caller default applies.
+    pub fail_under: Option<FailUnder>,
 }
 
 /// The project-level config path: always `<root>/sentinel.toml`.
@@ -136,23 +152,54 @@ fn merge_excludes(cli: &[String], project: &[String], user: &[String]) -> Vec<St
 /// caller (and therefore a test) decides without reading the process
 /// environment. Each unreadable or malformed file yields exactly one
 /// `config-invalid` diagnostic; missing files are silent.
+///
+/// Test-only: production resolves through [`resolve_full_with`], which also
+/// carries the scalar levels; this wrapper keeps the pre-existing
+/// exclude-level tests on their original seam.
+#[cfg(test)]
 pub(crate) fn resolve_with(
     root: &Path,
     cli: &[String],
     user: Option<PathBuf>,
 ) -> (Vec<String>, Vec<Diagnostic>) {
+    let (config, diagnostics) = resolve_full_with(root, cli, None, user);
+    (config.excludes, diagnostics)
+}
+
+/// First-set-wins across precedence levels: the CLI value applies when
+/// present, otherwise the project file's, otherwise the user file's.
+/// `None` at a level means that level is silent — it falls through instead
+/// of resetting a value set elsewhere. This is deliberately *not*
+/// [`merge_excludes`]: lists union because every pattern excludes, but a
+/// scalar names one policy, so levels must replace rather than combine.
+fn override_scalar<T: Clone>(cli: Option<T>, project: Option<T>, user: Option<T>) -> Option<T> {
+    cli.or(project).or(user)
+}
+
+/// Resolves the full effective configuration — merged excludes plus the
+/// scalar `fail_under` override chain — from explicit inputs (the hermetic
+/// seam): CLI values first, then the project file, then the user file at
+/// `user`, or no user level at all with `None`. Each unreadable or malformed
+/// file yields exactly one `config-invalid` diagnostic and contributes
+/// nothing at any key; missing files are silent.
+pub(crate) fn resolve_full_with(
+    root: &Path,
+    cli_excludes: &[String],
+    cli_fail_under: Option<FailUnder>,
+    user: Option<PathBuf>,
+) -> (ResolvedConfig, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
-    let mut project_excludes = Vec::new();
-    let project = project_path(root);
-    match load_file(&project) {
-        Ok(Some(config)) => project_excludes = config.exclude,
+    let mut project = FileConfig::default();
+    let project_path = project_path(root);
+    match load_file(&project_path) {
+        Ok(Some(config)) => project = config,
         Ok(None) => {}
-        Err(reason) => diagnostics.push(invalid_diagnostic(&project, root, &reason)),
+        Err(reason) => diagnostics.push(invalid_diagnostic(&project_path, root, &reason)),
     }
-    let mut user_excludes = Vec::new();
+    let mut user_config = FileConfig::default();
     if let Some(path) = user {
         match load_file(&path) {
-            Ok(Some(config)) => user_excludes = config.exclude,
+            Ok(Some(config)) => user_config = config,
             Ok(None) => {}
             Err(reason) => diagnostics.push(invalid_diagnostic(&path, root, &reason)),
         }
@@ -160,14 +207,21 @@ pub(crate) fn resolve_with(
     diagnostics.sort();
     diagnostics.dedup();
     (
-        merge_excludes(cli, &project_excludes, &user_excludes),
+        ResolvedConfig {
+            excludes: merge_excludes(cli_excludes, &project.exclude, &user_config.exclude),
+            fail_under: override_scalar(cli_fail_under, project.fail_under, user_config.fail_under),
+        },
         diagnostics,
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_excludes, project_path, resolve_with, user_path_with};
+    use super::{
+        merge_excludes, override_scalar, project_path, resolve_full_with, resolve_with,
+        user_path_with,
+    };
+    use crate::cli::FailUnder;
     use crate::test_util::{temp_repo, write_tracked, write_untracked};
     use std::ffi::OsStr;
     use std::path::PathBuf;
@@ -306,6 +360,121 @@ mod tests {
         assert!(diagnostics.is_empty());
     }
 
+    #[test]
+    fn scalar_override_prefers_cli_over_project_over_user() {
+        assert_eq!(
+            override_scalar(
+                Some(FailUnder::Critical),
+                Some(FailUnder::High),
+                Some(FailUnder::Low)
+            ),
+            Some(FailUnder::Critical),
+            "CLI wins over both files"
+        );
+        assert_eq!(
+            override_scalar(None, Some(FailUnder::High), Some(FailUnder::Low)),
+            Some(FailUnder::High),
+            "project wins over user"
+        );
+        assert_eq!(
+            override_scalar(None, None, Some(FailUnder::Low)),
+            Some(FailUnder::Low),
+            "user applies when nothing above it sets the key"
+        );
+        assert_eq!(
+            override_scalar::<FailUnder>(None, None, None),
+            None,
+            "absence everywhere stays absent, so the caller default applies"
+        );
+    }
+    #[test]
+    fn fail_under_resolves_through_config_levels() {
+        let (_dir, root) = temp_repo();
+        write_untracked(
+            &root,
+            OsStr::new("sentinel.toml"),
+            b"fail_under = \"high\"\n",
+        );
+        let xdg = tempfile::TempDir::new().unwrap();
+        let user_file = xdg.path().join("config.toml");
+        std::fs::write(&user_file, b"fail_under = \"low\"\n").unwrap();
+        let (config, diagnostics) = resolve_full_with(
+            &root,
+            &[],
+            Some(FailUnder::Critical),
+            Some(user_file.clone()),
+        );
+        assert_eq!(config.fail_under, Some(FailUnder::Critical), "CLI wins");
+        assert!(diagnostics.is_empty());
+        let (config, _) = resolve_full_with(&root, &[], None, Some(user_file.clone()));
+        assert_eq!(
+            config.fail_under,
+            Some(FailUnder::High),
+            "project wins over user"
+        );
+        std::fs::remove_file(root.join("sentinel.toml")).unwrap();
+        let (config, _) = resolve_full_with(&root, &[], None, Some(user_file));
+        assert_eq!(
+            config.fail_under,
+            Some(FailUnder::Low),
+            "user applies alone"
+        );
+        let (config, diagnostics) = resolve_full_with(&root, &[], None, None);
+        assert_eq!(config.fail_under, None, "absence stays absent");
+        assert!(diagnostics.is_empty());
+    }
+    #[test]
+    fn exclude_unions_while_fail_under_overrides() {
+        // The invariant the previous slice warned would break here: lists
+        // union across levels while the first scalar key replaces.
+        let (_dir, root) = temp_repo();
+        write_untracked(
+            &root,
+            OsStr::new("sentinel.toml"),
+            b"exclude = [\"project-*.log\"]\nfail_under = \"high\"\n",
+        );
+        let xdg = tempfile::TempDir::new().unwrap();
+        let user_file = xdg.path().join("config.toml");
+        std::fs::write(
+            &user_file,
+            b"exclude = [\"user-*.log\"]\nfail_under = \"low\"\n",
+        )
+        .unwrap();
+        let cli = vec!["cli-*.log".to_string()];
+        let (config, diagnostics) =
+            resolve_full_with(&root, &cli, Some(FailUnder::Medium), Some(user_file));
+        assert_eq!(
+            config.excludes,
+            vec![
+                "cli-*.log".to_string(),
+                "project-*.log".to_string(),
+                "user-*.log".to_string(),
+            ],
+            "every exclude level still contributes"
+        );
+        assert_eq!(
+            config.fail_under,
+            Some(FailUnder::Medium),
+            "the scalar replaces instead of merging: only the CLI value survives"
+        );
+        assert!(diagnostics.is_empty());
+    }
+    #[test]
+    fn malformed_fail_under_warns_once_and_contributes_nothing() {
+        let (_dir, root) = temp_repo();
+        write_untracked(
+            &root,
+            OsStr::new("sentinel.toml"),
+            b"fail_under = \"bogus\"\n",
+        );
+        let (config, diagnostics) = resolve_full_with(&root, &[], None, None);
+        assert_eq!(
+            config.fail_under, None,
+            "a bad value never becomes a policy"
+        );
+        assert_eq!(diagnostics.len(), 1, "exactly one diagnostic");
+        assert_eq!(diagnostics[0].code, "config-invalid");
+    }
     #[test]
     fn malformed_project_config_warns_once_and_contributes_nothing() {
         let (_dir, root) = temp_repo();
