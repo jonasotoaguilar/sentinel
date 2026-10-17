@@ -7,12 +7,16 @@ use serde::Serialize;
 
 use crate::finding::{Finding, Severity};
 
-/// The report envelope; field order is the wire order.
+/// The report envelope; field order is the wire order. `incomplete` is
+/// absent when the scan is complete and `true` when it degraded, so a
+/// machine consumer can tell an incomplete scan from a clean one.
 #[derive(Serialize)]
 struct Report<'a> {
     schema_version: &'static str,
     tool: Tool<'a>,
     findings: Vec<FindingReport<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    incomplete: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -77,6 +81,16 @@ where
 /// Renders the JSON report bytes: compact (`serde_json::to_vec`) plus a
 /// trailing newline; errors are serialization failures only.
 pub fn render_json(findings: &[Finding]) -> Result<Vec<u8>, serde_json::Error> {
+    render_json_with_status(findings, false)
+}
+
+/// Renders with the incompleteness signal: `incomplete` is absent when
+/// false (byte-identical to [`render_json`]) and `true` when the scan
+/// degraded. The field is additive; `schema_version` is unchanged.
+pub fn render_json_with_status(
+    findings: &[Finding],
+    incomplete: bool,
+) -> Result<Vec<u8>, serde_json::Error> {
     let report = Report {
         schema_version: "1.0.0",
         tool: Tool {
@@ -84,6 +98,7 @@ pub fn render_json(findings: &[Finding]) -> Result<Vec<u8>, serde_json::Error> {
             version: env!("CARGO_PKG_VERSION"),
         },
         findings: findings.iter().map(FindingReport::from).collect(),
+        incomplete: incomplete.then_some(true),
     };
     let mut bytes = serde_json::to_vec(&report)?;
     bytes.push(b'\n');

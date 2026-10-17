@@ -12,8 +12,8 @@ use crate::finding::{Diagnostic, Finding};
 
 mod json;
 mod sarif;
-pub use json::render_json;
-pub use sarif::render_sarif;
+pub use json::{render_json, render_json_with_status};
+pub use sarif::{render_sarif, render_sarif_with_status};
 
 /// Renders the findings report with one advisory line per finding that has
 /// one. Findings without advisory text render exactly as [`render_findings`]

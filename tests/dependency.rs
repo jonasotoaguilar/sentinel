@@ -396,3 +396,47 @@ fn advisory_id_and_summary_are_redacted_on_every_surface() {
         "raw summary secret leaked in report file: {report_blob}"
     );
 }
+
+#[test]
+fn degraded_scan_carries_incomplete_signal_and_clean_scan_carries_none() {
+    let (_dir, root) = temp_repo();
+    track_fixture(&root, "dependency/requirements.txt", "requirements.txt");
+    let xdg = TempDir::new().unwrap();
+    let json = scan_with(xdg.path(), &root, &["--offline", "--output", "json"]);
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(
+        report["incomplete"], true,
+        "degraded json must say incomplete"
+    );
+    let sarif = scan_with(xdg.path(), &root, &["--offline", "--output", "sarif"]);
+    let log: serde_json::Value = serde_json::from_slice(&sarif.stdout).unwrap();
+    let inv = &log["runs"][0]["invocations"];
+    assert_eq!(
+        inv[0]["executionSuccessful"], false,
+        "sarif must say unsuccessful"
+    );
+    assert!(inv[0]["toolExecutionNotifications"].is_array());
+    let schema: serde_json::Value =
+        serde_json::from_slice(&fixture_bytes("sarif-2.1.0.schema.json")).unwrap();
+    let compiled = jsonschema::draft7::new(&schema).unwrap();
+    assert!(
+        compiled.validate(&log).is_ok(),
+        "degraded sarif stays schema-valid"
+    );
+    let (_dir2, clean) = temp_repo();
+    std::fs::write(clean.join("ok.txt"), b"no secrets").unwrap();
+    git(&clean, ["add", "--", "ok.txt"]);
+    let xdg2 = TempDir::new().unwrap();
+    let json = scan_with(xdg2.path(), &clean, &["--offline", "--output", "json"]);
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert!(
+        report.get("incomplete").is_none(),
+        "clean json stays absent"
+    );
+    let sarif = scan_with(xdg2.path(), &clean, &["--offline", "--output", "sarif"]);
+    let log: serde_json::Value = serde_json::from_slice(&sarif.stdout).unwrap();
+    assert!(
+        log["runs"][0].get("invocations").is_none(),
+        "clean sarif stays absent"
+    );
+}

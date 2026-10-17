@@ -98,6 +98,8 @@ impl DependencyEngine {
                     match osv.query_all_with_deadline(&queries, deadline) {
                         Ok((results, batch_diags)) => {
                             diags.extend(batch_diags);
+                            let mut write_fails = 0u64;
+                            let mut write_msg = String::new();
                             for (pin, advs) in pending.iter().zip(results.iter()) {
                                 if let Some(c) = cache.as_ref() {
                                     let vals: Vec<serde_json::Value> = advs
@@ -105,12 +107,19 @@ impl DependencyEngine {
                                         .map(|adv| serde_json::json!({"id": adv.id, "summary": adv.summary, "severity": [{"type":"CVSS_V3","score": match adv.severity { Severity::Critical => "9.8", Severity::High => "7.5", Severity::Medium => "5.0", Severity::Low => "2.1" }}]}))
                                         .collect();
                                     if let Ok(b) = serde_json::to_vec(&vals) {
-                                        let _ = c.put(
+                                        // A failed write warns once below; the scan continues.
+                                        if let Err(e) = c.put(
                                             pin.ecosystem.as_str(),
                                             &pin.name,
                                             &pin.version,
                                             &b,
-                                        );
+                                        ) {
+                                            write_fails += 1;
+                                            if write_msg.is_empty() {
+                                                write_msg =
+                                                    crate::finding::sanitize(&e.to_string());
+                                            }
+                                        }
                                     }
                                 }
                                 for adv in advs {
@@ -122,26 +131,44 @@ impl DependencyEngine {
                                     ));
                                 }
                             }
+                            if write_fails > 0 {
+                                let noun = if write_fails == 1 { "pin" } else { "pins" };
+                                diags.push(Diagnostic::cache_write_failed(&format!(
+                                    "{write_fails} {noun} not cached: {write_msg}"
+                                )));
+                            }
                         }
                         Err(e) => {
+                            // One diagnostic per cause with a count, never one per pin.
                             let san = crate::finding::sanitize(&e);
+                            let mut stale_hit = 0u64;
+                            let mut unavailable = 0u64;
                             for pin in &pending {
                                 let stale = cache.as_ref().and_then(|c| {
                                     c.get_offline(pin.ecosystem.as_str(), &pin.name, &pin.version)
                                 });
                                 if let Some(b) = stale {
                                     if handle_cached(&b, pin, &mut diags, &mut out) {
-                                        diags.push(Diagnostic::osv_degraded(&san));
+                                        stale_hit += 1;
                                     } else {
-                                        diags.push(Diagnostic::cache_entry_corrupt(
-                                            &pin.path,
-                                            "stale cache corrupt",
-                                        ));
-                                        diags.push(Diagnostic::osv_unavailable(&pin.path, &san));
+                                        unavailable += 1;
                                     }
                                 } else {
-                                    diags.push(Diagnostic::osv_unavailable(&pin.path, &san));
+                                    unavailable += 1;
                                 }
+                            }
+                            if stale_hit > 0 {
+                                let noun = if stale_hit == 1 { "pin" } else { "pins" };
+                                diags.push(Diagnostic::osv_degraded(&format!(
+                                    "{stale_hit} {noun} served from stale cache: {san}"
+                                )));
+                            }
+                            if unavailable > 0 {
+                                let noun = if unavailable == 1 { "pin" } else { "pins" };
+                                diags.push(Diagnostic::osv_unavailable(
+                                    "",
+                                    &format!("{unavailable} {noun} unavailable: {san}"),
+                                ));
                             }
                         }
                     }
@@ -503,6 +530,83 @@ mod tests {
         assert!(!diags.iter().any(|d| d.code == "osv-unavailable"));
         assert!(findings.is_empty());
         assert_eq!(std::fs::read(&key).unwrap(), big);
+    }
+    #[test]
+    fn cache_write_failure_emits_one_diagnostic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let cache = XdgCache::with_root(file);
+        let stub = crate::osv::client::StubOsv::new(vec![(
+            vec![
+                serde_json::json!({"vulns":[{"id":"GHSA-W1","severity":[{"type":"CVSS_V3","score":"9.8"}]}]}),
+            ],
+            None,
+        )]);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("package-lock.json"),
+            r#"{"packages":{"node_modules/lodash":{"version":"4.17.20"}}}"#,
+        )
+        .unwrap();
+        let (findings, diags) = DependencyEngine::online(Some(cache), Box::new(stub))
+            .review(root.path(), &[PathBuf::from("package-lock.json")]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code, "cache-write-failed");
+    }
+    struct BadEnvelope;
+    impl crate::osv::client::OsvApi for BadEnvelope {
+        fn query_all(
+            &self,
+            _qs: &[crate::osv::client::Query],
+        ) -> Result<(Vec<Vec<crate::osv::validate::Advisory>>, Vec<Diagnostic>), String> {
+            Err("malformed batch envelope".into())
+        }
+        fn vuln(&self, _id: &str) -> Result<crate::osv::validate::Advisory, String> {
+            Err("malformed batch envelope".into())
+        }
+    }
+    #[test]
+    fn envelope_failure_summarized_to_one() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("package-lock.json"),
+            r#"{"packages":{"node_modules/lodash":{"version":"4.17.20"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.path().join("requirements.txt"), b"flask==2.3.3\n").unwrap();
+        let cache = XdgCache::with_root(tempfile::tempdir().unwrap().path().to_path_buf());
+        let (_, diags) = DependencyEngine::online(Some(cache), Box::new(BadEnvelope)).review(
+            root.path(),
+            &[
+                PathBuf::from("package-lock.json"),
+                PathBuf::from("requirements.txt"),
+            ],
+        );
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code, "osv-unavailable");
+    }
+    #[test]
+    fn repeated_failures_collapsed_with_count() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("package-lock.json"),
+            r#"{"packages":{"node_modules/lodash":{"version":"4.17.20"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.path().join("requirements.txt"), b"flask==2.3.3\n").unwrap();
+        let cache = XdgCache::with_root(tempfile::tempdir().unwrap().path().to_path_buf());
+        let (_, diags) = DependencyEngine::online(Some(cache), Box::new(FailOsv)).review(
+            root.path(),
+            &[
+                PathBuf::from("package-lock.json"),
+                PathBuf::from("requirements.txt"),
+            ],
+        );
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code, "osv-unavailable");
+        assert!(diags[0].message.contains('2'), "{diags:?}");
     }
     #[test]
     fn offline_absent_entry_is_still_a_miss() {
