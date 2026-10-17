@@ -250,6 +250,10 @@ pub fn run_with_deps(
     let _ = stderr.write_all(&render::render_diagnostics(&diagnostics));
 
     // Report formats render first, then write to stdout or the requested file.
+    // Machine formats carry an incompleteness signal only when something
+    // actually degraded: explain advisories are terminal-only, so their
+    // failures never mark the findings incomplete.
+    let incomplete = diagnostics.iter().any(|d| !d.code.starts_with("explain-"));
     let report_bytes = match output {
         // Without advisories the original renderer runs, so those bytes are
         // identical by construction, not just by delegation.
@@ -257,8 +261,12 @@ pub fn run_with_deps(
         OutputFormat::Terminal => render::render_findings_with_advisories(&findings, &advisories),
         OutputFormat::Json | OutputFormat::Sarif => {
             let rendered = match output {
-                OutputFormat::Json => render::render_json(&findings),
-                OutputFormat::Sarif => render::render_sarif(&findings),
+                // The complete path keeps the original renderer, so clean
+                // bytes are identical by construction, not just by delegation.
+                OutputFormat::Json if !incomplete => render::render_json(&findings),
+                OutputFormat::Json => render::render_json_with_status(&findings, true),
+                OutputFormat::Sarif if !incomplete => render::render_sarif(&findings),
+                OutputFormat::Sarif => render::render_sarif_with_status(&findings, true),
                 OutputFormat::Terminal => unreachable!(),
             };
             match rendered {

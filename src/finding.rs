@@ -186,4 +186,32 @@ impl Diagnostic {
             message: sanitize(msg),
         }
     }
+    /// A cache write failed; the scan continues without the entry.
+    pub fn cache_write_failed(msg: &str) -> Self {
+        Self {
+            code: "cache-write-failed",
+            path: String::new(),
+            rule: String::new(),
+            message: sanitize(msg),
+        }
+    }
+    /// A detail fetch failed so the finding keeps a default severity;
+    /// the guess is disclosed by naming the advisory.
+    pub fn advisory_severity_fallback(msg: &str) -> Self {
+        Self {
+            code: "advisory-severity-fallback",
+            path: String::new(),
+            rule: String::new(),
+            message: sanitize(msg),
+        }
+    }
+    /// The page cap was reached with more results pending; output is truncated.
+    pub fn osv_truncated(msg: &str) -> Self {
+        Self {
+            code: "osv-truncated",
+            path: String::new(),
+            rule: String::new(),
+            message: sanitize(msg),
+        }
+    }
 }

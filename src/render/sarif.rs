@@ -33,6 +33,25 @@ struct Log<'a> {
 struct Run<'a> {
     tool: Tool<'a>,
     results: Vec<SarifResult<'a>>,
+    // Absent on a complete scan (bytes unchanged); present with
+    // `executionSuccessful: false` plus a notification when degraded, per
+    // the SARIF 2.1.0 standard mechanism instead of an invented property.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invocations: Option<Vec<Invocation<'a>>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Invocation<'a> {
+    execution_successful: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_execution_notifications: Option<Vec<Notification<'a>>>,
+}
+
+#[derive(Serialize)]
+struct Notification<'a> {
+    level: &'static str,
+    message: Message<'a>,
 }
 
 #[derive(Serialize)]
@@ -105,6 +124,16 @@ fn level(severity: Severity) -> &'static str {
 /// Renders the SARIF 2.1.0 log bytes: compact (`serde_json::to_vec`) plus a
 /// trailing newline; errors are serialization failures only.
 pub fn render_sarif(findings: &[Finding]) -> Result<Vec<u8>, serde_json::Error> {
+    render_sarif_with_status(findings, false)
+}
+
+/// Renders with the incompleteness signal: no `invocations` when complete
+/// (byte-identical to [`render_sarif`]); otherwise one unsuccessful
+/// invocation carrying a warning notification.
+pub fn render_sarif_with_status(
+    findings: &[Finding],
+    incomplete: bool,
+) -> Result<Vec<u8>, serde_json::Error> {
     // Unique, lexicographically sorted rule-ID vector; each result's index is
     // its position in this vector via binary search (design).
     let mut rule_ids: Vec<&str> = findings.iter().map(|f| f.rule_id.as_str()).collect();
@@ -155,6 +184,17 @@ pub fn render_sarif(findings: &[Finding]) -> Result<Vec<u8>, serde_json::Error> 
                 },
             },
             results,
+            invocations: incomplete.then(|| {
+                vec![Invocation {
+                    execution_successful: false,
+                    tool_execution_notifications: Some(vec![Notification {
+                        level: "warning",
+                        message: Message {
+                            text: "scan incomplete: dependency data degraded, results may be missing",
+                        },
+                    }]),
+                }]
+            }),
         }],
     };
     let mut bytes = serde_json::to_vec(&log)?;
