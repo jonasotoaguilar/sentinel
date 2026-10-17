@@ -1,0 +1,9 @@
+- id: sentinel
+  name: sentinel
+  description: Scan the repository for secrets and known-vulnerable dependencies.
+  entry: sentinel scan --ci
+  language: rust
+  # sentinel scans the repository, not a list of files, so pre-commit must not
+  # pass filenames and must not skip the hook when a commit stages none.
+  pass_filenames: false
+  always_run: true
