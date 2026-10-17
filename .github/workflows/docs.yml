@@ -1,0 +1,59 @@
+name: Docs site
+
+# Renders the markdown in docs/ with mdbook and publishes it to GitHub Pages.
+# The pages are generated from the same files a reader can open in the
+# repository, so the site cannot say something the repository does not.
+#
+# mdbook is installed from crates.io rather than through a third-party action:
+# this repository keeps its action surface to GitHub's own, and one
+# `cargo install` is cheaper to trust than another publisher in the pipeline.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'book.toml'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: docs-site
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build the site
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install mdbook
+        run: cargo install mdbook --locked
+
+      - name: Build
+        run: mdbook build
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: book
+
+  deploy:
+    name: deploy to Pages
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

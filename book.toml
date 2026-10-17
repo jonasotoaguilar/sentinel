@@ -1,0 +1,16 @@
+[book]
+title = "Sentinel"
+description = "Scan a repository for secrets and known-vulnerable dependencies before commit or in CI."
+authors = ["jonasotoaguilar"]
+language = "en"
+# The book renders the markdown that already lives in docs/, rather than a
+# second copy of it, so the site and the repository cannot drift apart.
+src = "docs"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/jonasotoaguilar/sentinel"
+edit-url-template = "https://github.com/jonasotoaguilar/sentinel/edit/main/{path}"
