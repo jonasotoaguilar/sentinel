@@ -159,7 +159,9 @@ impl SecretsEngine {
     /// Applies the curated production table to text that never crosses an
     /// engine boundary on its own (file paths, finding ids): every secret
     /// the table knows is replaced, so a secret in a name cannot leave the
-    /// process while the surrounding path stays readable.
+    /// process while the surrounding path stays readable. Guarantees
+    /// placeholder substitution only; it neither bounds length nor strips
+    /// control characters, and shapes the table does not know pass through.
     pub fn redact_production(text: &str) -> String {
         static TABLE: OnceLock<SecretsEngine> = OnceLock::new();
         TABLE.get_or_init(SecretsEngine::new).redact(text)

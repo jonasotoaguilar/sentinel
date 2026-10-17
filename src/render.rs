@@ -2,7 +2,7 @@
 //! stderr bytes (terminal-rendering spec). No timestamps, ANSI escapes,
 //! targets, or thread ids — pure functions of the scan result.
 //!
-//! `json` (PR1) and `sarif` (PR2) are pure sub-renderers at the same
+//! `json` and `sarif` are pure sub-renderers at the same
 //! boundary; terminal rendering below stays byte-identical.
 use std::collections::BTreeMap;
 use std::io::Write;

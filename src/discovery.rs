@@ -578,7 +578,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Preserved tracked-only behavior (PR1 regression guard)
+    // Preserved tracked-only behavior (regression guard for the tracked path)
     // ------------------------------------------------------------------
 
     #[test]

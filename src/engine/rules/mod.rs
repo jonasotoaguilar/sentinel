@@ -1,5 +1,5 @@
-//! Code-rules engine (PR1 skeleton plus the JavaScript/TypeScript rule set);
-//! Python rules arrive as further entries in the rule table.
+//! Code-rules engine over the pinned rule table below (JavaScript, TypeScript,
+//! TSX, Python); adding a rule is a table entry plus its matcher.
 
 pub mod javascript;
 pub mod lang;
@@ -114,7 +114,7 @@ pub(crate) struct RuleDef {
     matches: Matcher,
 }
 
-/// The production table; PR3 extends this list without other changes.
+/// The production table; extending it is a table entry plus its matcher.
 const RULE_DEFS: &[RuleDef] = &[
     javascript::WEAK_HASH_DEF,
     javascript::DYNAMIC_CODE_DEF,

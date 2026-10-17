@@ -147,7 +147,10 @@ impl DependencyEngine {
                                 if let Some(c) = cache.as_ref() {
                                     let vals: Vec<serde_json::Value> = advs
                                         .iter()
-                                        .map(|adv| serde_json::json!({"id": adv.id, "summary": adv.summary, "severity": [{"type":"CVSS_V3","score": match adv.severity { Severity::Critical => "9.8", Severity::High => "7.5", Severity::Medium => "5.0", Severity::Low => "2.1" }}]}))
+                                        // Same single source: the score string is the representative
+                                        // from `validate::cvss_for_severity`, so cache write-back
+                                        // cannot drift from the finding path above.
+                                        .map(|adv| serde_json::json!({"id": adv.id, "summary": adv.summary, "severity": [{"type":"CVSS_V3","score": format!("{:.1}", validate::cvss_for_severity(adv.severity))}]}))
                                         .collect();
                                     if let Ok(b) = serde_json::to_vec(&vals) {
                                         // A failed write warns once below; the scan continues.
@@ -222,13 +225,10 @@ impl DependencyEngine {
         (out, diags)
     }
 }
+/// Representative CVSS score for a severity (cache write-back shape): delegates to
+/// [`validate::cvss_for_severity`], the single inverse of [`validate::severity_for`].
 fn cvss(s: Severity) -> Option<f64> {
-    match s {
-        Severity::Critical => Some(9.8),
-        Severity::High => Some(7.5),
-        Severity::Medium => Some(5.0),
-        Severity::Low => Some(2.1),
-    }
+    Some(validate::cvss_for_severity(s))
 }
 fn handle_cached(b: &[u8], pin: &Pin, diags: &mut Vec<Diagnostic>, out: &mut Vec<Finding>) -> bool {
     if b.len() > 1024 * 1024 {
@@ -286,9 +286,9 @@ mod tests {
     }
     #[test]
     fn offline_engine_constructs_no_client() {
-        let b = crate::osv::client::constructions();
+        let b = crate::osv::client::ureq_client_constructions();
         assert!(crate::osv::client::UreqOsvClient::maybe_new(true).is_none());
-        assert_eq!(crate::osv::client::constructions(), b);
+        assert_eq!(crate::osv::client::ureq_client_constructions(), b);
     }
     #[test]
     fn seeded_cache_hit_resolves_pinned_rule_id() {

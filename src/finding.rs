@@ -69,6 +69,9 @@ pub struct Diagnostic {
     /// Deterministic detail.
     pub message: String,
 }
+/// Bounds a diagnostic message: drops control characters except newline and tab,
+/// then caps at 200 chars. Guarantees bounded, control-stripped text; it does
+/// not redact secrets and does not make the text single-line.
 pub(crate) fn sanitize(m: &str) -> String {
     m.chars()
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
