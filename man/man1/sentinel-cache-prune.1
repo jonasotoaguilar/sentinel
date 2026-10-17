@@ -1,0 +1,16 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH sentinel-cache-prune 1  "prune " 
+.SH NAME
+sentinel\-cache\-prune \- Remove cache entries not used since the given age and report what was removed. Last use is approximated by the entry\*(Aqs modification time. A prune that removes nothing succeeds and reports zero
+.SH SYNOPSIS
+\fBsentinel\-cache\-prune\fR [\fB\-\-older\-than\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Remove cache entries not used since the given age and report what was removed. Last use is approximated by the entry\*(Aqs modification time. A prune that removes nothing succeeds and reports zero
+.SH OPTIONS
+.TP
+\fB\-\-older\-than\fR \fI<DAYS>\fR [default: 30]
+Remove entries whose last use is older than this many days. Defaults to 30: recent advisory data survives while stale entries are reclaimed
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
