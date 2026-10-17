@@ -312,7 +312,7 @@ All engines share one contract: file or manifest input → zero or more **raw fi
 
 ### Observability
 
-- `tracing` + `tracing-subscriber` to **stderr** only; stdout is reserved for findings/reports.
+- Diagnostics are reported on stderr as structured findings; stdout is reserved for findings/reports. There is no logging framework.
 - Structured spans per stage (scan, discovery, per-engine, normalize, render, explain); events for degradations (OSV degraded, cache miss, LLM skipped/failed) at warn level in default verbosity.
 - Verbosity controlled via `RUST_LOG`; spans/events must never carry secret material (only redacted evidence and counts).
 - Alerting before users report does not apply (local CLI, no service) — the analogous contract is: warnings reach stderr in default mode, and failures map to stable exit codes.
@@ -341,7 +341,7 @@ All engines share one contract: file or manifest input → zero or more **raw fi
 | Stable fingerprints + dedupe across engines/runs | PRD KPI 2; attribution and reproducibility for reviewers; stable fingerprints exclude run-dependent data (timestamps, absolute paths, execution order) | Run-order keys (non-deterministic); hash of raw evidence only (unstable across line moves) |
 | OSV client: batch query + pagination + detail fetches, TTL 24 h cache, offline degrade (warn/skip, never fail) | Batch minimizes requests; pagination is a documented research constraint; TTL bounds staleness; offline is a PRD product rule | Cacheless online-only (violates offline rule); full local advisory DB (violates no-DB); infinite cache (unbounded staleness) — ADR-0002 |
 | Explain adapter: isolated, opt-in, sync HTTP, redacted context, untrusted output, never severity/blocking, off in CI/offline | PRD hard rule enforced by construction; redaction at engine boundary makes raw secrets structurally unreachable | LLM-in-the-loop severity (explicitly rejected by PRD); no explainer (PRD lists it in scope) — ADR-0003 |
-| Errors: thiserror for domain errors, anyhow for app composition; tracing to stderr | Domain errors are typed and stable (rule/engine errors); app layer composes without ceremony; stdout reserved for findings | Custom error enum everywhere (boilerplate); panics on failure (no exit-code contract) |
+| Errors: thiserror for domain errors; diagnostics on stderr, no logging framework | Domain errors are typed and stable (rule/engine errors); diagnostics are structured findings on stderr; stdout reserved for findings | Custom error enum everywhere (boilerplate); panics on failure (no exit-code contract) |
 | Tree-sitter with a skip-and-warn policy for unparseable files | Grammar coverage gaps are a known risk (PRD risk register); skipping keeps scans sound and findings deterministic per rule set | Pure AST-only (gaps → silent misses); regex-only (loses AST value) |
 | Out-of-bound adapters behind interfaces with two real adapters (HTTP + local stub server) | Module-design rule: seams only with real adapters; tests exercise the public interface | Mocking own internals (smell); no seam (network-bound tests) |
 
