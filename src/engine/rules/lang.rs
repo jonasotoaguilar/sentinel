@@ -15,7 +15,6 @@ pub enum RulesLanguage {
 /// Selects the grammar for a path by its extension, case-insensitively.
 /// Returns `None` for unlisted extensions and extensionless paths; those
 /// files are skipped silently (no finding, no diagnostic, no parse attempt).
-#[allow(dead_code)] // Consumed by the rules engine in the next work unit of this chain.
 pub fn detect(path: &str) -> Option<RulesLanguage> {
     let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let extension = file.rsplit('.').next()?;
