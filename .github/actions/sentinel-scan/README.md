@@ -21,6 +21,11 @@ jobs:
         with:
           version: latest
 ```
+- `attestations: read` — so the action can verify the downloaded archive's
+  build provenance with `gh attestation verify`. Without it the action still
+  checks the checksums, and it says so rather than skipping quietly; but the
+  provenance check is the reason the action verifies before running anything.
+
 
 ## Permissions
 

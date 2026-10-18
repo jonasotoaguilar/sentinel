@@ -24,6 +24,9 @@ on:
 
 permissions:
   contents: read
+  # the action verifies the downloaded archive's provenance before running it
+  attestations: read
+  # and uploads the report to code scanning
   security-events: write
 
 concurrency:
