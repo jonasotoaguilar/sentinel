@@ -14,8 +14,16 @@ concurrency:
 
 jobs:
   test:
-    name: Test, Lint & Coverage
-    runs-on: ubuntu-latest
+    # The product claims cross-platform support and until now proved one
+    # platform. macOS and Windows run the same suite here.
+    name: Test, Lint & Coverage (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # A platform that fails must not cancel the others: the reason to run a
+      # matrix is to learn which platform broke and how.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -51,12 +59,15 @@ jobs:
         run: cargo test --all-features
 
       - name: Install coverage tool (cargo-llvm-cov)
+        if: runner.os == 'Linux'
         run: cargo install cargo-llvm-cov --locked
 
       - name: Collect coverage (lcov)
+        if: runner.os == 'Linux'
         run: cargo llvm-cov --all-features --lcov --output-path lcov.info
 
       - name: Upload coverage report
+        if: runner.os == 'Linux'
         if: always() && hashFiles('lcov.info') != ''
         uses: actions/upload-artifact@v7
         with:
