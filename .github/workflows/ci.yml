@@ -67,8 +67,9 @@ jobs:
         run: cargo llvm-cov --all-features --lcov --output-path lcov.info
 
       - name: Upload coverage report
-        if: runner.os == 'Linux'
-        if: always() && hashFiles('lcov.info') != ''
+        # Both conditions in one key: a step cannot carry two `if:` lines, and
+        # the second would silently win over the first.
+        if: always() && runner.os == 'Linux' && hashFiles('lcov.info') != ''
         uses: actions/upload-artifact@v7
         with:
           name: coverage-test
