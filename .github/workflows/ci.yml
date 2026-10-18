@@ -18,6 +18,14 @@ jobs:
     # platform. macOS and Windows run the same suite here.
     name: Test, Lint & Coverage (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # The job's scripts are written in POSIX shell, and a `run:` step on
+        # Windows defaults to PowerShell, where `[ ! -f Cargo.toml ]` is not a
+        # test at all. The first Windows run failed in the bootstrap gate for
+        # exactly that reason, ten seconds in. GitHub's Windows runners ship
+        # bash, and every script in this job is written in it.
+        shell: bash
     strategy:
       # A platform that fails must not cancel the others: the reason to run a
       # matrix is to learn which platform broke and how.
