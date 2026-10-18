@@ -235,6 +235,10 @@ fn unpinned_lines_skip_with_path_and_line_and_never_exit_two() {
 }
 
 #[test]
+#[cfg_attr(
+    not(unix),
+    ignore = "mode-000 unreadability is a Unix permission concept"
+)]
 fn unreadable_manifest_emits_exactly_one_read_failed() {
     // Why: the scan shares what it reads with the dependency review, so one
     // unreadable manifest warns once; the old second disk read warned twice.
@@ -251,11 +255,6 @@ fn unreadable_manifest_emits_exactly_one_read_failed() {
             );
             return;
         }
-    }
-    #[cfg(not(unix))]
-    {
-        eprintln!("SKIP unreadable-manifest: mode-000 unreadability is Unix-only");
-        return;
     }
     let xdg = TempDir::new().unwrap();
     let output = scan_with(xdg.path(), &root, &["--offline"]);
