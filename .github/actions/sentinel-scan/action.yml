@@ -44,6 +44,12 @@ runs:
       name: 'Install verified Sentinel release'
       shell: bash
       env:
+        # `gh` refuses to talk to GitHub inside a workflow without a token,
+        # so without this the attestation check cannot run at all - and a check
+        # that could not run must never be reported as one that passed. The token
+        # carries whatever the calling job's permissions allow, which is why the
+        # action's README asks for `attestations: read`.
+        GH_TOKEN: ${{ github.token }}
         SENTINEL_INPUT_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
