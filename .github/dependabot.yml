@@ -22,3 +22,17 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+
+  # The example pins a dependency with known advisories on purpose: it is the
+  # fixture that makes the dependency engine's output real rather than
+  # hypothetical. Bumping it would delete the thing the example demonstrates,
+  # so updates to it are ignored here. The security *alerts* for it are left
+  # alone: they are accurate, and dismissing a true signal is worse than
+  # living with a known one.
+  - package-ecosystem: pip
+    directory: /examples/basic-scan
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    ignore:
+      - dependency-name: requests
