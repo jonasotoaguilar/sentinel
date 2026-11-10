@@ -43,8 +43,8 @@ that reports vulnerabilities. The policy is **enforced rather than described**:
   explicit license allow-list.
 - `cargo deny check` and `cargo audit` run on every pull request and every push
   to `main`, so a violation fails CI instead of being noticed later.
-- Dependencies are updated by Dependabot on a weekly schedule, with minor and
-  patch updates grouped so the review cost stays proportionate.
+- Dependency updates are applied by hand and reviewed like any other change.
+  No automated updater opens pull requests here.
 
 A change to this policy belongs in `deny.toml`, not in this document: if the
 two disagree, the file wins.
