@@ -10,7 +10,12 @@ use tempfile::TempDir;
 /// (no system/global config, no user home) and returns it with its root.
 pub fn temp_repo() -> (TempDir, PathBuf) {
     let dir = TempDir::new().unwrap();
-    let root = dir.path().to_path_buf();
+    // Canonicalised because that is the path git reports back: on macOS the
+    // temporary directory lives under /var, which is a symlink to /private/var,
+    // so a test comparing the discovered root against the raw temporary path
+    // fails on macOS and passes everywhere else. The TempDir keeps the original
+    // path for cleanup.
+    let root = dir.path().canonicalize().unwrap();
     git(&root, ["init", "-q"]);
     (dir, root)
 }
